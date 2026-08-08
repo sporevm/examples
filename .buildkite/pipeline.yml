@@ -1,0 +1,20 @@
+steps:
+  - label: ":docker: Rails RSpec ARM64 benchmark"
+    key: rails-rspec-arm64-benchmark
+    if: build.env("SPOREVM_RAILS_IMAGE") != null
+    agents:
+      queue: sporevm-linux-arm64
+    command: |
+      set -euo pipefail
+      case "$${SPOREVM_RAILS_IMAGE:-}" in
+        *@sha256:????????????????????????????????????????????????????????????????) ;;
+        *) echo "SPOREVM_RAILS_IMAGE must be digest-pinned" >&2; exit 2 ;;
+      esac
+      python3 rails/bin/benchmark buildkite \
+        --image "$${SPOREVM_RAILS_IMAGE}" \
+        --shards "$${SPOREVM_RAILS_SHARDS:-4}" \
+        --iterations "$${SPOREVM_RAILS_ITERATIONS:-5}" \
+        --warmups 1 \
+        --report rails-rspec-buildkite.json
+    artifact_paths:
+      - rails-rspec-buildkite.json

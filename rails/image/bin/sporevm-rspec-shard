@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "digest"
 
 IDENTITY_ENV = "/run/sporevm/env"
 IDENTITY_JSON = "/run/sporevm/generation.json"
@@ -92,6 +93,18 @@ def read_identity
     identity = parse_env_identity(IDENTITY_ENV) || parse_json_identity(IDENTITY_JSON)
     return identity if identity
 
+    if ENV["SPORE_PARALLEL_JOB"] && ENV["SPORE_PARALLEL_JOB_COUNT"]
+      begin
+        return {
+          "parallel_index" => Integer(ENV.fetch("SPORE_PARALLEL_JOB"), 10),
+          "parallel_count" => Integer(ENV.fetch("SPORE_PARALLEL_JOB_COUNT"), 10),
+          "source" => "process-environment"
+        }
+      rescue ArgumentError => e
+        abort "invalid direct shard identity: #{e.message}"
+      end
+    end
+
     break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
     sleep 0.1
@@ -138,6 +151,8 @@ preload_for_capture(capture_delay) if capture_delay
 identity = read_identity
 parallel_index = identity.fetch("parallel_index")
 parallel_count = identity.fetch("parallel_count")
+source_revision = ENV.fetch("SPOREVM_SOURCE_REVISION", "")
+abort "missing SPOREVM_SOURCE_REVISION" unless source_revision.match?(/\A[0-9a-f]{40}\z/)
 
 if parallel_count < 1
   abort "invalid SPORE_PARALLEL_JOB_COUNT=#{parallel_count}"
@@ -148,13 +163,18 @@ end
 
 specs = Dir["spec/**/*_spec.rb"].sort
 selected = specs.each_with_index.select { |_path, i| (i % parallel_count) == parallel_index }.map(&:first)
+selected_digest = Digest::SHA256.hexdigest(selected.map { |path| "#{path}\n" }.join)
 
-puts "SPOREVM_RSPEC_SHARD parallel_index=#{parallel_index} parallel_count=#{parallel_count} selected=#{selected.length} identity_source=#{identity.fetch("source")}"
+puts "SPOREVM_RAILS_WARM_TIMING initdb_ms=#{ENV.fetch("SPOREVM_RAILS_INITDB_MS")} postgres_ms=#{ENV.fetch("SPOREVM_RAILS_POSTGRES_MS")} schema_ms=#{ENV.fetch("SPOREVM_RAILS_SCHEMA_MS")} before_preload_ms=#{ENV.fetch("SPOREVM_RAILS_BEFORE_PRELOAD_MS")}"
+
+puts "SPOREVM_RSPEC_SHARD parallel_index=#{parallel_index} parallel_count=#{parallel_count} selected=#{selected.length} selected_sha256=#{selected_digest} source_revision=#{source_revision} identity_source=#{identity.fetch("source")}"
+execution_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 if selected.empty?
-  puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=0"
+  puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=0 duration_ms=0 source_revision=#{source_revision}"
   exit 0
 end
 
 status = run_specs(selected)
-puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=#{status}"
+duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - execution_start) * 1000).round
+puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=#{status} duration_ms=#{duration_ms} source_revision=#{source_revision}"
 exit status

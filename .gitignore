@@ -5,3 +5,5 @@
 *.children
 *.children/
 tmp/
+__pycache__/
+*.pyc

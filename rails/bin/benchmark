@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Repeated, digest-pinned Rails benchmark (stdlib only)."""
+import argparse, base64, datetime as dt, hashlib, json, math, os, platform, re
+import subprocess, sys, tempfile, threading, time, uuid
+from pathlib import Path
+
+SCHEMA = "sporevm-examples.rails-rspec-benchmark.v2"
+COMPARISON_SCHEMA = "sporevm-examples.rails-rspec-benchmark-comparison.v2"
+ROOT = Path(__file__).resolve().parents[2]
+SPEC_ROOT = ROOT / "rails" / "app"
+DIGEST_REF = re.compile(r"^.+@sha256:[0-9a-fA-F]{64}$")
+MARKER_LINE = re.compile(r"^(SPOREVM_(?:RSPEC_SHARD|RSPEC_DONE|RAILS_WARM_TIMING))\s+(.+)$")
+CACHE_POSTURE = "warm-resident-v1: digest image prefetch outside timing; identical excluded warmups; caches remain resident"
+
+def now(): return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+def require_digest_ref(v, label="image"):
+    if not DIGEST_REF.fullmatch(v): raise ValueError(f"{label} must be pinned by @sha256:<64 hex digits>")
+    return v
+def inventory(root=SPEC_ROOT):
+    paths = sorted(p.relative_to(root).as_posix() for p in root.glob("spec/**/*_spec.rb"))
+    if not paths: raise ValueError("local spec inventory is empty")
+    return {"paths": paths, "count": len(paths), "sha256": path_digest(paths)}
+def path_digest(paths): return hashlib.sha256("".join(p + "\n" for p in paths).encode()).hexdigest()
+def shard_paths(paths, index, count): return [p for n, p in enumerate(paths) if n % count == index]
+def nearest_rank(values, p):
+    if not values: raise ValueError("cannot percentile an empty collection")
+    return sorted(values)[math.ceil(p * len(values)) - 1]
+def percentiles(values): return {"p50": nearest_rank(values,.5), "p95": nearest_rank(values,.95), "p99": nearest_rank(values,.99)}
+def integer(fields, key, nonnegative=True):
+    if key not in fields or not re.fullmatch(r"-?\d+", fields[key]): raise ValueError(f"missing or malformed {key}")
+    value=int(fields[key]);
+    if nonnegative and value < 0: raise ValueError(f"negative {key}")
+    return value
+def optional_ms_env(name):
+    raw=os.getenv(name)
+    if raw is None or raw=="": return None
+    try: value=float(raw)
+    except ValueError as exc: raise ValueError(f"{name} must be a finite nonnegative millisecond value") from exc
+    if not math.isfinite(value) or value<0: raise ValueError(f"{name} must be a finite nonnegative millisecond value")
+    return value
+def parse_fields(raw):
+    fields={}
+    for token in raw.split():
+        if token.count("=") != 1: raise ValueError("malformed marker field")
+        k,v=token.split("=",1)
+        if not k or not v or k in fields: raise ValueError("malformed or duplicate marker field")
+        fields[k]=v
+    return fields
+def parse_markers(output, index=None, count=None, revision=None, require_warm=True):
+    found={}
+    for line in output.splitlines():
+        m=MARKER_LINE.fullmatch(line.strip())
+        if not m: continue
+        if m.group(1) in found: raise ValueError(f"duplicate {m.group(1)} marker")
+        found[m.group(1)]=parse_fields(m.group(2))
+    required=["SPOREVM_RSPEC_SHARD","SPOREVM_RSPEC_DONE"]
+    if require_warm: required.append("SPOREVM_RAILS_WARM_TIMING")
+    if any(x not in found for x in required): raise ValueError("missing required benchmark marker")
+    shard,done=found["SPOREVM_RSPEC_SHARD"],found["SPOREVM_RSPEC_DONE"]
+    si,sc=integer(shard,"parallel_index"),integer(shard,"parallel_count")
+    di,dc=integer(done,"parallel_index"),integer(done,"parallel_count")
+    if (si,sc)!=(di,dc): raise ValueError("SHARD and DONE identities mismatch")
+    if index is not None and si != index: raise ValueError("shard index mismatch")
+    if count is not None and sc != count: raise ValueError("shard count mismatch")
+    if sc < 1 or si >= sc: raise ValueError("invalid shard identity")
+    source=shard.get("source_revision")
+    if not re.fullmatch(r"[0-9a-f]{40}",source or "") or done.get("source_revision") != source or (revision is not None and source != revision): raise ValueError("source revision mismatch")
+    digest=shard.get("selected_sha256","")
+    if not re.fullmatch(r"[0-9a-f]{64}",digest): raise ValueError("invalid selected digest")
+    exit_code=integer(done,"exit")
+    if exit_code: raise ValueError("RSpec marker reports nonzero exit")
+    result={"index":si,"selectedCount":integer(shard,"selected"),"selectedSha256":digest,
+            "executionMs":integer(done,"duration_ms"),"sourceRevision":source}
+    if require_warm:
+        warm=found["SPOREVM_RAILS_WARM_TIMING"]
+        result["setupMs"]={k:integer(warm,k) for k in ("initdb_ms","postgres_ms","schema_ms","before_preload_ms")}
+    return result
+def validate_assignment(parsed, paths, index, count, revision):
+    expected=shard_paths(paths,index,count)
+    if parsed["index"] != index or parsed["sourceRevision"] != revision or parsed["selectedCount"] != len(expected) or parsed["selectedSha256"] != path_digest(expected):
+        raise ValueError(f"shard {index} deterministic assignment mismatch")
+
+def extract_runtime_report(text):
+    decoder=json.JSONDecoder(); candidates=[]
+    for m in re.finditer(r"\{",text):
+        try: value,_=decoder.raw_decode(text[m.start():])
+        except json.JSONDecodeError: continue
+        if isinstance(value,dict) and isinstance(value.get("plan"),dict) and isinstance(value.get("summary"),dict) and "finishedAt" in value["summary"]: candidates.append(value)
+    if len(candidates)!=1: raise ValueError("expected exactly one RuntimeReport JSON object")
+    return candidates[0]
+def timestamp(value):
+    try: result=dt.datetime.fromisoformat(value.replace("Z","+00:00"))
+    except (AttributeError,ValueError): raise ValueError("malformed RuntimeReport timestamp")
+    if result.tzinfo is None: raise ValueError("RuntimeReport timestamp lacks timezone")
+    return result
+def validate_runtime_report(report, run_id, shards):
+    s=report.get("summary",{})
+    if s.get("runID") != run_id: raise ValueError("RuntimeReport run ID mismatch")
+    exact={"childCount":shards,"shardCount":1,"assignedChildren":shards,"assignedShards":1,
+           "attemptCount":shards,"completedChildren":shards,"succeededChildren":shards,
+           "failedChildren":0,"skippedTerminalChildren":0,"platformMismatches":0,"nonTerminalFailures":0,"leaseErrors":0}
+    if s.get("state") != "succeeded": raise ValueError("RuntimeReport did not succeed")
+    for key,value in exact.items():
+        if s.get(key) != value: raise ValueError(f"RuntimeReport {key} mismatch")
+    start,finish=timestamp(s.get("startedAt")),timestamp(s.get("finishedAt"))
+    if finish < start: raise ValueError("RuntimeReport timestamps are reversed")
+    execution_ms=round((finish-start).total_seconds()*1000)
+    prepare=report.get("prepare")
+    if not isinstance(prepare,dict) or prepare.get("childCount") != shards: raise ValueError("RuntimeReport prepare summary mismatch")
+    timings=prepare.get("timingsMs")
+    if not isinstance(timings,dict): raise ValueError("RuntimeReport prepare timings missing")
+    run_save=timings.get("runSave"); fork=timings.get("fork")
+    if not isinstance(run_save,(int,float)) or run_save < 0 or not isinstance(fork,(int,float)) or fork < 0: raise ValueError("RuntimeReport prepare timings malformed")
+    return {"executionMs":execution_ms,"prepareMs":run_save+fork,"workloadWallMs":run_save+fork+execution_ms}
+
+def parse_terminal_results(text, run_id, shards, paths, revision):
+    results={}
+    for line in text.splitlines():
+        if not line.startswith("SPOREVM_TERMINAL_JSON_BASE64 "): continue
+        try: obj=json.loads(base64.b64decode(line.split(" ",1)[1],validate=True))
+        except Exception as exc: raise ValueError("malformed verifier terminal result") from exc
+        child=obj.get("childID")
+        if not isinstance(child,int) or child<0 or child>=shards or child in results: raise ValueError("missing-range or duplicate child ID")
+        expected_attempt=f"{run_id}-child-{child}-attempt-01"
+        if obj.get("runID")!=run_id or obj.get("attemptID")!=expected_attempt or obj.get("status")!="succeeded" or obj.get("terminal") is not True: raise ValueError("invalid terminal result identity/status")
+        out=obj.get("output")
+        if not isinstance(out,dict) or out.get("stdoutTruncated") or out.get("stderrTruncated"): raise ValueError("missing or truncated output preview")
+        chunks=[]
+        for stream in ("stdout","stderr"):
+            encoded=out.get(stream+"PreviewBase64",""); total=out.get(stream+"Bytes",0)
+            if not isinstance(total,int) or total<0: raise ValueError("malformed output byte count")
+            try: raw=base64.b64decode(encoded,validate=True)
+            except Exception as exc: raise ValueError("malformed output preview") from exc
+            if len(raw)!=total: raise ValueError("truncated output preview")
+            chunks.append(raw.decode("utf-8","strict"))
+        parsed=parse_markers("\n".join(chunks),child,shards,revision); validate_assignment(parsed,paths,child,shards,revision)
+        results[child]={**parsed,"childID":child,"attemptID":obj.get("attemptID")}
+    if set(results)!=set(range(shards)): raise ValueError("missing terminal child results")
+    return [results[i] for i in range(shards)]
+
+def git_source(allow_dirty=False):
+    rev=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip()
+    dirty=bool(subprocess.check_output(["git","status","--porcelain"],cwd=ROOT,text=True).strip())
+    if dirty and not allow_dirty: raise ValueError("source tree is dirty; --allow-dirty is test-only")
+    return rev,dirty
+def atomic_write(path,obj):
+    target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix="."+target.name+".",dir=target.parent)
+    try:
+        with os.fdopen(fd,"w") as f: json.dump(obj,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,target)
+    except BaseException:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+def reset_report(path):
+    try: Path(path).unlink()
+    except FileNotFoundError: pass
+def common(args):
+    require_digest_ref(args.image,"workload image")
+    if args.shards<1 or args.iterations<1 or args.warmups!=1: raise ValueError("shards/iterations must be positive and the canonical benchmark requires exactly one warmup")
+    rev,dirty=git_source(args.allow_dirty)
+    return {"schema":SCHEMA,"schemaVersion":2,"createdAt":now(),"success":False,"workload":{"revision":rev,"sourceDirty":dirty,"image":args.image,"inventory":inventory(),"shardCount":args.shards,"iterations":args.iterations,"warmups":args.warmups,"platform":"linux/arm64","cachePosture":CACHE_POSTURE}}
+def summarize(samples): return {"fanoutWallSamplesMs":samples,"fanoutWallPercentilesMs":percentiles(samples)}
+
+def docker_inspect(args,revision):
+    present=subprocess.run([args.docker,"image","inspect",args.image],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode == 0
+    subprocess.run([args.docker,"pull","--platform","linux/arm64",args.image],check=True,stdout=subprocess.DEVNULL)
+    raw=subprocess.check_output([args.docker,"image","inspect",args.image],text=True); data=json.loads(raw)
+    if len(data) != 1: raise ValueError("Docker inspect did not return exactly one image")
+    image=data[0]; label=image.get("Config",{}).get("Labels",{}).get("org.opencontainers.image.revision")
+    if label != revision: raise ValueError("image OCI revision does not equal checkout HEAD")
+    if image.get("Os") != "linux" or image.get("Architecture") not in ("arm64","aarch64"): raise ValueError("workload image is not linux/arm64")
+    env=image.get("Config",{}).get("Env",[])
+    if f"SPOREVM_SOURCE_REVISION={revision}" not in env: raise ValueError("image does not bake checkout revision into SPOREVM_SOURCE_REVISION")
+    return present
+def buildkite(args):
+    reset_report(args.report)
+    report=common(args); arch=platform.machine().lower()
+    if arch not in ("arm64","aarch64") and not args.test_only_allow_non_arm64: raise ValueError("Buildkite worker must be arm64/aarch64")
+    if os.getenv("BUILDKITE_COMMIT") and os.environ["BUILDKITE_COMMIT"] != report["workload"]["revision"]: raise ValueError("Buildkite commit does not equal checkout HEAD")
+    pre=time.monotonic_ns(); present=docker_inspect(args,report["workload"]["revision"]); prefetch=(time.monotonic_ns()-pre)//1_000_000
+    paths=report["workload"]["inventory"]["paths"]; owned=set(); lock=threading.Lock()
+    def fanout(sequence):
+        rows=[None]*args.shards; completed=[None]*args.shards; errors=[]
+        def one(i):
+            name=f"sporevm-rails-bench-{os.getpid()}-{sequence}-{i}"
+            with lock: owned.add(name)
+            cmd=[args.docker,"run","--name",name,"--platform","linux/arm64","-e",f"SPORE_PARALLEL_JOB={i}","-e",f"SPORE_PARALLEL_JOB_COUNT={args.shards}",args.image,"/bin/bash","/usr/local/bin/sporevm-rails-coordinator","--no-capture"]
+            started=time.monotonic_ns()
+            try:
+                p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                completed[i]=time.monotonic_ns()
+                if p.returncode: raise RuntimeError(f"container shard {i} exited nonzero")
+                parsed=parse_markers(p.stdout+"\n"+p.stderr,i,args.shards,report["workload"]["revision"]); validate_assignment(parsed,paths,i,args.shards,report["workload"]["revision"])
+                rows[i]={**parsed,"processWallMs":(completed[i]-started)//1_000_000,"exitCode":0}
+            except Exception as exc: errors.append(exc)
+            finally:
+                cleanup=subprocess.run([args.docker,"rm","-f",name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                if cleanup.returncode and not errors: errors.append(RuntimeError(f"could not remove benchmark container {i}"))
+                if cleanup.returncode == 0:
+                    with lock: owned.discard(name)
+        started=time.monotonic_ns(); threads=[threading.Thread(target=one,args=(i,)) for i in range(args.shards)]
+        for t in threads:t.start()
+        for t in threads:t.join()
+        if errors: raise errors[0]
+        if any(value is None for value in completed): raise RuntimeError("a benchmark container did not report completion")
+        return (max(completed)-started)//1_000_000,rows
+    try:
+        warm=[]; measured=[]; fanouts=[]
+        for n in range(args.warmups+args.iterations):
+            wall,rows=fanout(n); phase="warmup" if n<args.warmups else "measured"; (warm if phase=="warmup" else measured).append(wall); fanouts.append({"phase":phase,"fanoutWallMs":wall,"shards":rows})
+    finally:
+        for name in list(owned): subprocess.run([args.docker,"rm","-f",name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    report["createdAt"]=now()
+    queue_wait=optional_ms_env("SPOREVM_BUILDKITE_QUEUE_WAIT_MS"); checkout=optional_ms_env("SPOREVM_BUILDKITE_CHECKOUT_MS")
+    report.update({"kind":"buildkite-docker","success":True,"imagePrefetch":{"alreadyPresent":present,"durationMs":prefetch},"timing":{**summarize(measured),"excludedWarmupFanoutWallSamplesMs":warm},"fanouts":fanouts,"system":{"platform":"linux/arm64","architecture":arch},"buildkite":{"buildNumber":os.getenv("BUILDKITE_BUILD_NUMBER"),"queueWaitMs":queue_wait,"queueWaitSource":"SPOREVM_BUILDKITE_QUEUE_WAIT_MS" if queue_wait is not None else "unavailable: Buildkite does not expose queue duration to job commands","checkoutMs":checkout,"checkoutSource":"SPOREVM_BUILDKITE_CHECKOUT_MS" if checkout is not None else "unavailable: checkout completes before job commands"}})
+    atomic_write(args.report,report)
+
+def kubernetes_name(prefix,raw):
+    clean="".join(c.lower() if c.isalnum() or c=="-" else "-" for c in raw).strip("-") or "run"
+    suffix=hashlib.sha256(raw.encode()).hexdigest()[:8]; base=f"{prefix}-{clean}"[:54].rstrip("-")
+    return f"{base}-{suffix}"
+def kubectl_json(argv,args): return json.loads(subprocess.check_output([args.kubectl,*argv],text=True))
+def agent_provenance(args):
+    pods=kubectl_json(["get","pods","-n",args.namespace,"-l","app.kubernetes.io/name=spore-agent,app.kubernetes.io/part-of=sporevm-k8s","-o","json"],args).get("items",[])
+    healthy=[p for p in pods if p.get("status",{}).get("phase")=="Running" and any(c.get("type")=="Ready" and c.get("status")=="True" for c in p.get("status",{}).get("conditions",[]))]
+    if len(healthy)!=1: raise ValueError("benchmark requires exactly one healthy selected agent pod")
+    p=healthy[0]; statuses=p["status"].get("containerStatuses",[])
+    if len(statuses)!=1 or not statuses[0].get("imageID"): raise ValueError("agent runtime imageID unavailable")
+    arch=p.get("spec",{}).get("nodeSelector",{}).get("kubernetes.io/arch")
+    if arch not in ("arm64","aarch64"): raise ValueError("agent node is not ARM64")
+    container=p["spec"]["containers"][0]; slots=None; result_backend=None; result_root=None
+    for arg in container.get("args",[]):
+        if arg.startswith("--slots="): slots=integer({"slots":arg.split("=",1)[1]},"slots")
+        if arg.startswith("--result-store-backend="): result_backend=arg.split("=",1)[1]
+        if arg.startswith("--result-store-root="): result_root=arg.split("=",1)[1]
+    if slots is None or slots < args.shards: raise ValueError("agent does not expose enough concurrent execution slots for requested fanout")
+    if result_backend != "local" or result_root != args.result_root: raise ValueError("agent local result-store configuration does not match benchmark verifier")
+    return {"identity":{"podUID":p["metadata"]["uid"],"nodeName":p["spec"]["nodeName"]},"report":{"configuredRuntimeImage":container["image"],"runtimeImageID":statuses[0]["imageID"],"architecture":arch,"executionSlots":slots,"healthy":True,"sporeVMVersion":None,"versionVerification":"not exposed by public agent status"}}
+def result_pod_manifest(name,node,args,bucket,key,read_results):
+    if read_results:
+        script='target="$ROOT/$BUCKET/$KEY"; terminals="$(find "$target/children" -mindepth 2 -maxdepth 2 -name terminal.json -type f 2>/dev/null | wc -l | tr -d " ")"; attempts="$(find "$target/children" -mindepth 3 -maxdepth 3 -path "*/attempts/*.json" -type f 2>/dev/null | wc -l | tr -d " ")"; [ "$terminals" = "$EXPECTED" ] && [ "$attempts" = "$EXPECTED" ]; find "$target/children" -mindepth 2 -maxdepth 2 -name terminal.json -type f -exec sh -c \'for f do printf "SPOREVM_TERMINAL_JSON_BASE64 "; base64 <"$f" | tr -d "\\n"; printf "\\n"; done\' sh {} +; rm -rf -- "$target"; [ ! -e "$target" ]'
+    else:
+        script='target="$ROOT/$BUCKET/$KEY"; rm -rf -- "$target"; [ ! -e "$target" ]'
+    return {"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":args.namespace},"spec":{"restartPolicy":"Never","nodeName":node,"automountServiceAccountToken":False,"tolerations":[{"key":"sporevm.io/agent","operator":"Equal","value":"true","effect":"NoSchedule"}],"containers":[{"name":"verifier","image":args.verifier_image or args.runtime_image,"imagePullPolicy":"IfNotPresent","command":["/bin/sh","-ec",script],"env":[{"name":"ROOT","value":"/results"},{"name":"BUCKET","value":bucket},{"name":"KEY","value":key},{"name":"EXPECTED","value":str(args.shards)}],"volumeMounts":[{"name":"results","mountPath":"/results"}]}],"volumes":[{"name":"results","hostPath":{"path":args.result_root,"type":"Directory"}}]}}
+def k8s(args):
+    reset_report(args.report)
+    base=common(args); require_digest_ref(args.runtime_image,"Kubernetes coordinator image")
+    if args.verifier_image: require_digest_ref(args.verifier_image,"verifier image")
+    before=agent_provenance(args); paths=base["workload"]["inventory"]["paths"]; measured=[]; warm=[]; iterations=[]
+    for seq in range(args.warmups+args.iterations):
+        run_id=f"rails-bench-{uuid.uuid4().hex}"; bucket="sporevm-benchmark"; key=f"rails-rspec/{run_id}"; verifier=kubernetes_name("rails-verifier",run_id); result_cleanup=kubernetes_name("rails-cleanup",run_id)
+        run={"runID":run_id,"source":{"image":args.image,"platform":"linux/arm64"},"prepare":{"command":["/bin/bash","/usr/local/bin/sporevm-rails-coordinator","--capture-delay","2"],"captureSignal":"USR1","readyMarker":"SPOREVM_RAILS_READY","memory":"2gb"},"fork":{"count":args.shards},"children":{"start":0,"count":args.shards,"command":["/usr/local/bin/sporevm-rspec-shard"]},"execution":{"childrenPerShard":args.shards,"maxInFlightPerAgent":args.shards},"retryPolicy":{"maxAttemptsPerChild":1,"rerunCommittedChildren":False},"sideEffects":{"idempotencyRequired":True},"resultStore":f"s3://{bucket}/{key}/"}
+        error=None; cleanup=[]; job_deleted=False; verifier_created=False; results_cleaned=False
+        with tempfile.TemporaryDirectory() as td:
+            rp=Path(td)/"run.json"; rp.write_text(json.dumps(run)); vp=Path(td)/"verifier.json"; cp=Path(td)/"cleanup.json"
+            try:
+                started=time.monotonic_ns(); proc=subprocess.run([args.sporectl,"submit","--namespace",args.namespace,"--image",args.runtime_image,"--result-store-backend","local","--timeout",f"{args.timeout}s","--kubectl",args.kubectl,str(rp)],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=args.timeout+60)
+                submission=(time.monotonic_ns()-started)//1_000_000
+                if proc.returncode: raise RuntimeError("sporectl submit exited nonzero")
+                runtime=extract_runtime_report(proc.stdout+"\n"+proc.stderr); runtime_wall=validate_runtime_report(runtime,run_id,args.shards); wall=runtime_wall["workloadWallMs"]
+                job=subprocess.run([args.kubectl,"delete","job",kubernetes_name("spore-coordinator",run_id),"-n",args.namespace,"--ignore-not-found=true","--wait=true","--cascade=foreground"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                if job.returncode: raise RuntimeError("could not delete completed coordinator Job")
+                job_deleted=True
+                vp.write_text(json.dumps(result_pod_manifest(verifier,before["identity"]["nodeName"],args,bucket,key,True)))
+                subprocess.run([args.kubectl,"apply","-f",str(vp)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); verifier_created=True
+                subprocess.run([args.kubectl,"wait","-n",args.namespace,"--for=jsonpath={.status.phase}=Succeeded",f"pod/{verifier}",f"--timeout={args.timeout}s"],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                logs=subprocess.check_output([args.kubectl,"logs","-n",args.namespace,verifier],text=True)
+                shards=parse_terminal_results(logs,run_id,args.shards,paths,base["workload"]["revision"])
+                results_cleaned=True
+                prepare=runtime["prepare"]
+                safe_prepare={"childCount":prepare["childCount"],"bundleDigest":prepare.get("bundleDigest"),"timingsMs":prepare["timingsMs"]}
+                iterations.append({"runID":run_id,"phase":"warmup" if seq<args.warmups else "measured","fanoutWallMs":wall,"prepareWallMs":runtime_wall["prepareMs"],"coordinatorRunWallMs":runtime_wall["executionMs"],"submissionWallMs":submission,"runtimeTimings":runtime.get("timings"),"prepare":safe_prepare,"shards":shards})
+                (warm if seq<args.warmups else measured).append(wall)
+            except Exception as exc: error=exc
+            finally:
+                if not job_deleted:
+                    job=subprocess.run([args.kubectl,"delete","job",kubernetes_name("spore-coordinator",run_id),"-n",args.namespace,"--ignore-not-found=true","--wait=true","--cascade=foreground"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    if job.returncode: cleanup.append("job")
+                    else: job_deleted=True
+                if job_deleted:
+                    if verifier_created:
+                        p=subprocess.run([args.kubectl,"delete","pod",verifier,"-n",args.namespace,"--ignore-not-found=true","--wait=true"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        if p.returncode: cleanup.append("verifier pod")
+                    if not results_cleaned:
+                        cp.write_text(json.dumps(result_pod_manifest(result_cleanup,before["identity"]["nodeName"],args,bucket,key,False)))
+                        applied=subprocess.run([args.kubectl,"apply","-f",str(cp)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        waited=subprocess.run([args.kubectl,"wait","-n",args.namespace,"--for=jsonpath={.status.phase}=Succeeded",f"pod/{result_cleanup}",f"--timeout={args.timeout}s"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) if applied.returncode == 0 else applied
+                        deleted=subprocess.run([args.kubectl,"delete","pod",result_cleanup,"-n",args.namespace,"--ignore-not-found=true","--wait=true"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                        if applied.returncode or waited.returncode or deleted.returncode: cleanup.append("result prefix")
+                        else: results_cleaned=True
+                    p=subprocess.run([args.kubectl,"delete","configmap",kubernetes_name("spore-run",run_id),"-n",args.namespace,"--ignore-not-found=true","--wait=true"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    if p.returncode: cleanup.append("configmap")
+            if error or cleanup: raise RuntimeError((str(error) if error else "workload succeeded") + ("; cleanup failed: "+",".join(cleanup) if cleanup else ""))
+    after=agent_provenance(args)
+    if before != after: raise RuntimeError("agent provenance or health changed during benchmark")
+    base["createdAt"]=now()
+    base.update({"kind":"kubernetes-sporevm","success":True,"coordinatorRuntimeImage":args.runtime_image,"agentProvenance":before["report"],"timing":{**summarize(measured),"excludedWarmupFanoutWallSamplesMs":warm,"submissionWallSamplesMs":[x["submissionWallMs"] for x in iterations if x["phase"]=="measured"]},"iterations":iterations,"cleanup":{"success":True}})
+    atomic_write(args.report,base)
+
+def positive_samples(value,count,label):
+    if not isinstance(value,list) or len(value)!=count: raise ValueError(f"{label} sample count mismatch")
+    if any(isinstance(x,bool) or not isinstance(x,(int,float)) or not math.isfinite(x) or x<=0 for x in value): raise ValueError(f"{label} samples must be finite and positive")
+    return value
+def nonnegative_number(value,label):
+    if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0: raise ValueError(f"{label} must be finite and nonnegative")
+    return value
+def validate_report_shards(rows,workload,run_id=None,docker=False):
+    count=workload["shardCount"]; paths=workload["inventory"]["paths"]; revision=workload["revision"]
+    if not isinstance(rows,list) or len(rows)!=count or any(not isinstance(row,dict) for row in rows): raise ValueError("fanout shard records mismatch")
+    for index,row in enumerate(rows):
+        validate_assignment(row,paths,index,count,revision)
+        nonnegative_number(row.get("executionMs"),f"shard {index} executionMs")
+        if docker:
+            if row.get("exitCode")!=0: raise ValueError("Docker shard exit mismatch")
+            if nonnegative_number(row.get("processWallMs"),f"Docker shard {index} processWallMs")<=0: raise ValueError("Docker shard process wall must be positive")
+        elif row.get("childID")!=index or row.get("attemptID")!=f"{run_id}-child-{index}-attempt-01": raise ValueError("Kubernetes shard attempt identity mismatch")
+def validate_report(report,kind):
+    if report.get("schema")!=SCHEMA or report.get("schemaVersion")!=2 or report.get("kind")!=kind or report.get("success") is not True: raise ValueError(f"invalid {kind} report envelope")
+    workload=report.get("workload")
+    if not isinstance(workload,dict): raise ValueError("workload provenance missing")
+    revision=workload.get("revision")
+    if not re.fullmatch(r"[0-9a-f]{40}",revision or "") or workload.get("sourceDirty") is not False: raise ValueError("workload source provenance is not clean")
+    require_digest_ref(workload.get("image", ""),"workload image")
+    inventory_value=workload.get("inventory")
+    if not isinstance(inventory_value,dict): raise ValueError("workload inventory missing")
+    paths=inventory_value.get("paths")
+    if not isinstance(paths,list) or not paths or any(not isinstance(x,str) or not x for x in paths) or paths!=sorted(set(paths)): raise ValueError("workload inventory paths are not sorted, unique and nonempty")
+    if inventory_value.get("count")!=len(paths) or inventory_value.get("sha256")!=path_digest(paths): raise ValueError("workload inventory digest/count mismatch")
+    shards=workload.get("shardCount"); iterations=workload.get("iterations"); warmups=workload.get("warmups")
+    if isinstance(shards,bool) or not isinstance(shards,int) or shards<1 or isinstance(iterations,bool) or not isinstance(iterations,int) or iterations<1 or isinstance(warmups,bool) or not isinstance(warmups,int) or warmups!=1: raise ValueError("workload fanout counts are invalid")
+    if workload.get("platform")!="linux/arm64" or workload.get("cachePosture")!=CACHE_POSTURE: raise ValueError("workload platform/cache posture mismatch")
+    timing=report.get("timing")
+    if not isinstance(timing,dict): raise ValueError("timing report missing")
+    samples=positive_samples(timing.get("fanoutWallSamplesMs"),iterations,"measured fanout")
+    warmup=positive_samples(timing.get("excludedWarmupFanoutWallSamplesMs"),1,"warmup fanout")
+    if timing.get("fanoutWallPercentilesMs")!=percentiles(samples): raise ValueError("fanout percentile summary mismatch")
+    if kind=="buildkite-docker":
+        system=report.get("system",{})
+        if system.get("platform")!="linux/arm64" or system.get("architecture") not in ("arm64","aarch64"): raise ValueError("Buildkite report is not linux/arm64")
+        records=report.get("fanouts")
+        if not isinstance(records,list) or len(records)!=iterations+1 or [x.get("phase") for x in records if isinstance(x,dict)]!=["warmup"]+["measured"]*iterations: raise ValueError("Buildkite fanout records mismatch")
+        for record in records: nonnegative_number(record.get("fanoutWallMs"),"Buildkite fanout wall"); validate_report_shards(record.get("shards"),workload,docker=True)
+        if [x["fanoutWallMs"] for x in records[1:]]!=samples or [records[0]["fanoutWallMs"]]!=warmup: raise ValueError("Buildkite fanout records do not match timing samples")
+    else:
+        require_digest_ref(report.get("coordinatorRuntimeImage", ""),"coordinator runtime image")
+        provenance=report.get("agentProvenance",{})
+        require_digest_ref(provenance.get("runtimeImageID", ""),"agent runtime image ID")
+        if report.get("cleanup",{}).get("success") is not True or provenance.get("architecture") not in ("arm64","aarch64") or provenance.get("healthy") is not True or isinstance(provenance.get("executionSlots"),bool) or not isinstance(provenance.get("executionSlots"),int) or provenance.get("executionSlots")<shards: raise ValueError("Kubernetes cleanup/agent provenance is invalid")
+        records=report.get("iterations")
+        if not isinstance(records,list) or len(records)!=iterations+1 or any(not isinstance(x,dict) for x in records) or [x.get("phase") for x in records]!=["warmup"]+["measured"]*iterations: raise ValueError("Kubernetes iteration records mismatch")
+        run_ids=[]
+        for record in records:
+            run_id=record.get("runID")
+            if not re.fullmatch(r"rails-bench-[0-9a-f]{32}",run_id or ""): raise ValueError("Kubernetes iteration run ID is invalid")
+            run_ids.append(run_id)
+            wall=nonnegative_number(record.get("fanoutWallMs"),"Kubernetes fanout wall"); prepare_wall=nonnegative_number(record.get("prepareWallMs"),"Kubernetes prepare wall"); execution_wall=nonnegative_number(record.get("coordinatorRunWallMs"),"Kubernetes coordinator wall")
+            if wall<=0 or prepare_wall+execution_wall!=wall: raise ValueError("Kubernetes fanout wall decomposition mismatch")
+            nonnegative_number(record.get("submissionWallMs"),"Kubernetes submission wall")
+            prepare=record.get("prepare")
+            if not isinstance(prepare,dict) or prepare.get("childCount")!=shards or not isinstance(prepare.get("timingsMs"),dict): raise ValueError("Kubernetes prepare record mismatch")
+            run_save=nonnegative_number(prepare["timingsMs"].get("runSave"),"Kubernetes runSave"); fork=nonnegative_number(prepare["timingsMs"].get("fork"),"Kubernetes fork")
+            if run_save+fork!=prepare_wall: raise ValueError("Kubernetes prepare timings mismatch")
+            validate_report_shards(record.get("shards"),workload,run_id=run_id)
+        if len(set(run_ids))!=len(run_ids): raise ValueError("Kubernetes iteration run IDs are not unique")
+        if [x["fanoutWallMs"] for x in records[1:]]!=samples or [records[0]["fanoutWallMs"]]!=warmup: raise ValueError("Kubernetes iteration records do not match timing samples")
+        submissions=timing.get("submissionWallSamplesMs")
+        if not isinstance(submissions,list) or submissions!=[x["submissionWallMs"] for x in records[1:]]: raise ValueError("Kubernetes submission samples mismatch")
+    return workload,samples
+def comparison(a,b):
+    aw,av=validate_report(a,"buildkite-docker"); bw,bv=validate_report(b,"kubernetes-sporevm")
+    keys=("revision","sourceDirty","image","inventory","shardCount","iterations","warmups","platform","cachePosture")
+    mismatch=[k for k in keys if aw[k]!=bw[k]]
+    if mismatch: raise ValueError("incompatible reports: "+", ".join(mismatch))
+    am,bm=nearest_rank(av,.5),nearest_rank(bv,.5)
+    return {"schema":COMPARISON_SCHEMA,"schemaVersion":2,"createdAt":now(),"success":True,"headlineMetric":"measured fanout wall median","buildkite":{"rawFanoutWallSamplesMs":av,"percentilesMs":percentiles(av),"medianMs":am},"kubernetes":{"rawFanoutWallSamplesMs":bv,"percentilesMs":percentiles(bv),"medianMs":bm},"kubernetesToBuildkiteRatio":bm/am,"buildkiteToKubernetesRatio":am/bm,"kubernetesDeltaMs":bm-am,"kubernetesFaster":bm<am,"workload":aw}
+def compare(args):
+    if args.report: reset_report(args.report)
+    result=comparison(json.loads(Path(args.buildkite_report).read_text()),json.loads(Path(args.k8s_report).read_text()))
+    if args.require_k8s_faster and not result["kubernetesFaster"]: raise RuntimeError("Kubernetes median was not faster")
+    if args.report: atomic_write(args.report,result)
+    print(json.dumps(result,indent=2,sort_keys=True))
+def parser():
+    p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="command",required=True)
+    for name in ("buildkite","k8s"):
+        q=sub.add_parser(name); q.add_argument("--image",required=True); q.add_argument("--shards",type=int,required=True); q.add_argument("--iterations",type=int,default=5); q.add_argument("--warmups",type=int,default=1); q.add_argument("--report",required=True); q.add_argument("--allow-dirty",action="store_true",help="TEST ONLY")
+    q=sub.choices["buildkite"]; q.add_argument("--docker",default="docker"); q.add_argument("--test-only-allow-non-arm64",action="store_true")
+    q=sub.choices["k8s"]; q.add_argument("--runtime-image",required=True); q.add_argument("--sporectl",default="sporectl"); q.add_argument("--kubectl",default="kubectl"); q.add_argument("--namespace",default="sporevm-system"); q.add_argument("--result-root",default="/var/lib/sporevm/results"); q.add_argument("--verifier-image"); q.add_argument("--timeout",type=int,default=1800)
+    q=sub.add_parser("compare"); q.add_argument("--buildkite-report",required=True); q.add_argument("--k8s-report",required=True); q.add_argument("--report"); q.add_argument("--require-k8s-faster",action="store_true")
+    return p
+def main():
+    args=parser().parse_args()
+    try: {"buildkite":buildkite,"k8s":k8s,"compare":compare}[args.command](args)
+    except (ValueError,RuntimeError,subprocess.SubprocessError,OSError,KeyError,ZeroDivisionError) as exc: print(f"error: {exc}",file=sys.stderr); return 1
+    return 0
+if __name__=="__main__": raise SystemExit(main())

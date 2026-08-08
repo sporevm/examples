@@ -141,9 +141,16 @@ docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
 if [[ "${push}" == "1" ]]; then
   [[ "${image_ref}" != local/* ]] || die "--push requires a registry image ref, not ${image_ref}"
+  repo_root="$(git -C "${example_dir}" rev-parse --show-toplevel)"
+  [[ -z "$(git -C "${repo_root}" status --porcelain)" ]] || die "--push requires a clean source checkout"
+  source_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+  [[ "${source_revision}" =~ ^[0-9a-f]{40}$ ]] || die "could not resolve an exact source revision"
+  [[ "${image_ref}" == *":sha-${source_revision}" ]] || die "--push image ref must end in :sha-${source_revision}"
   phase "build and push Rails image"
   docker buildx build \
     --platform "${platform}" \
+    --build-arg "VCS_REF=${source_revision}" \
+    --build-arg "SOURCE_URL=https://github.com/sporevm/examples" \
     -t "${image_ref}" \
     --push \
     "${example_dir}"
