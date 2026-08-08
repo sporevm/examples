@@ -176,3 +176,100 @@ SPORE_RAILS_FANOUT_COUNT=4
 SPORE_RAILS_MEMORY=2gb
 SPORE_RAILS_CAPTURE_DELAY=2
 ```
+
+## Docker versus Kubernetes benchmark
+
+The published ARM64 workload image is
+`ghcr.io/sporevm/examples-rails-rspec`. From a clean checkout, publish the exact
+source revision under its immutable tag, then resolve that tag to a manifest
+digest:
+
+```bash
+revision="$(git rev-parse HEAD)"
+rails/bin/build-image --push \
+  --image "ghcr.io/sporevm/examples-rails-rspec:sha-${revision}"
+docker buildx imagetools inspect \
+  "ghcr.io/sporevm/examples-rails-rspec:sha-${revision}"
+```
+
+The publisher refuses dirty checkouts, non-ARM64 platforms, and any tag other
+than `sha-<full commit>`. It builds from a `git archive` of that exact revision,
+so ignored or untracked working-tree files cannot enter the image, and bakes the
+revision into the OCI label and workload markers. Use the resulting
+`ghcr.io/sporevm/examples-rails-rspec@sha256:...` in all commands; the benchmark
+deliberately refuses tags.
+
+The Docker baseline is one Buildkite job on one `sporevm-linux-arm64` worker.
+It prefetches the image, then starts all N independent containers concurrently
+and measures that local wall itself. This is intentionally **not** Buildkite
+parallelism: queue and checkout time are therefore excluded. The report records
+whether the image was already present and prefetch duration separately.
+Buildkite does not expose queue duration or checkout timing to job commands, so
+those report fields are explicitly unavailable unless the trigger or an agent
+hook supplies `SPOREVM_BUILDKITE_QUEUE_WAIT_MS` and
+`SPOREVM_BUILDKITE_CHECKOUT_MS`. Record the Buildkite UI/API values alongside a
+published result when those overrides are unavailable; they never enter the
+headline runtime ratio.
+
+```bash
+python3 rails/bin/benchmark buildkite \
+  --image ghcr.io/sporevm/examples-rails-rspec@sha256:<64-hex-digest> \
+  --shards 4 --iterations 5 --warmups 1 --report /tmp/rails-buildkite.json
+
+python3 rails/bin/benchmark k8s \
+  --image ghcr.io/sporevm/examples-rails-rspec@sha256:<64-hex-digest> \
+  --runtime-image ghcr.io/sporevm/k8s-runtime@sha256:<64-hex-digest> \
+  --shards 4 --iterations 5 --warmups 1 --report /tmp/rails-k8s.json
+
+python3 rails/bin/benchmark compare \
+  --buildkite-report /tmp/rails-buildkite.json \
+  --k8s-report /tmp/rails-k8s.json \
+  --report /tmp/rails-comparison.json
+```
+
+Each measured iteration is one complete N-shard fanout; the identical excluded
+warmup defaults to one fanout. Image prefetch is outside timing and caches stay
+resident, so this is explicitly a warm-cache benchmark, not a cold-start claim.
+Reports retain every measured fanout wall and nearest-rank p50/p95/p99. The
+headline comparison is the median reported prepare + fork + child-execution
+wall versus the median Docker fanout wall. Queue/checkout, image prefetch,
+submission/admission, verifier log retrieval, and cleanup are never included in
+that speed ratio.
+
+The current fixture has two RSpec files. A run with more than two shards is a
+setup-and-fanout benchmark: extra shards still start from the same prepared
+Rails/PostgreSQL image but legitimately receive no spec files. Results from
+this fixture therefore support a claim about repeated setup versus one-time
+setup plus snapshot/fork fanout for this exact workload. They are not evidence
+of general Rails suite throughput, cold-start performance, hardware-normalized
+VM-versus-container performance, or broader Kubernetes/CI performance.
+
+The Kubernetes agent must be configured with at least N execution slots and
+enough memory for N concurrent 2 GiB children plus the agent. The public chart
+defaults to one slot, so an N=4 benchmark deployment needs `agent.slots=4` and
+appropriately sized resource requests/limits; the benchmark fails its preflight
+rather than silently reducing concurrency.
+
+`k8s` submits one source run per fanout that prepares Rails/Postgres once,
+captures, forks N children, and executes concurrently. It uses the agents'
+local result store with a synthetic `s3://sporevm-benchmark/...` identity. One
+temporary verifier pod on the selected agent node reads terminal documents,
+then removes only that run's result prefix; there is no exec or port-forward.
+Every marker, child result, RuntimeReport count and source/modulo assignment is
+validated. The verifier starts only after `sporectl submit` has completed and
+the coordinator Job has been deleted, so agents cannot still be publishing
+attempt records when the verifier removes the exact result prefix. Failure and
+interruption paths delete and wait for the coordinator Job before using a
+separate node-local cleanup pod. The verifier pod and exact hashed coordinator
+Job/ConfigMap names are deleted before an atomic success report is written.
+Defaults match the public chart; `--namespace`,
+`--kubectl`, `--sporectl`, `--runtime-image`, `--result-root`, and
+`--verifier-image` provide explicit deployment overrides.
+
+Only compare successful reports with the same clean Git revision, exact image,
+sorted nonempty inventory, shard/iteration/warmup counts, linux/arm64 platform,
+and cache posture; the comparator enforces all of these boundaries. The initial
+topology is one ARM64 Buildkite worker versus one ARM64 Kubernetes agent/node.
+Repeated measured distributions are evidence, not a universal performance
+claim. The report intentionally makes no claim about cluster node CPU or memory. Use
+`--require-k8s-faster` only when a gating assertion is explicitly desired.
