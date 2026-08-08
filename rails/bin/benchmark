@@ -306,16 +306,26 @@ def positive_samples(value,count,label):
 def nonnegative_number(value,label):
     if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0: raise ValueError(f"{label} must be finite and nonnegative")
     return value
+def nonnegative_integer(value,label):
+    if isinstance(value,bool) or not isinstance(value,int) or value<0: raise ValueError(f"{label} must be a nonnegative integer")
+    return value
 def validate_report_shards(rows,workload,run_id=None,docker=False):
     count=workload["shardCount"]; paths=workload["inventory"]["paths"]; revision=workload["revision"]
     if not isinstance(rows,list) or len(rows)!=count or any(not isinstance(row,dict) for row in rows): raise ValueError("fanout shard records mismatch")
     for index,row in enumerate(rows):
+        nonnegative_integer(row.get("index"),f"shard {index} index")
+        nonnegative_integer(row.get("selectedCount"),f"shard {index} selectedCount")
+        nonnegative_integer(row.get("executionMs"),f"shard {index} executionMs")
+        setup=row.get("setupMs"); setup_keys=("initdb_ms","postgres_ms","schema_ms","before_preload_ms")
+        if not isinstance(setup,dict) or set(setup)!=set(setup_keys): raise ValueError(f"shard {index} setupMs mismatch")
+        for key in setup_keys: nonnegative_integer(setup[key],f"shard {index} setupMs.{key}")
         validate_assignment(row,paths,index,count,revision)
-        nonnegative_number(row.get("executionMs"),f"shard {index} executionMs")
         if docker:
-            if row.get("exitCode")!=0: raise ValueError("Docker shard exit mismatch")
+            if isinstance(row.get("exitCode"),bool) or not isinstance(row.get("exitCode"),int) or row["exitCode"]!=0: raise ValueError("Docker shard exit mismatch")
             if nonnegative_number(row.get("processWallMs"),f"Docker shard {index} processWallMs")<=0: raise ValueError("Docker shard process wall must be positive")
-        elif row.get("childID")!=index or row.get("attemptID")!=f"{run_id}-child-{index}-attempt-01": raise ValueError("Kubernetes shard attempt identity mismatch")
+        elif (isinstance(row.get("childID"),bool) or not isinstance(row.get("childID"),int) or
+              row["childID"]!=index or row.get("attemptID")!=f"{run_id}-child-{index}-attempt-01"):
+            raise ValueError("Kubernetes shard attempt identity mismatch")
 def validate_report(report,kind):
     if report.get("schema")!=SCHEMA or report.get("schemaVersion")!=2 or report.get("kind")!=kind or report.get("success") is not True: raise ValueError(f"invalid {kind} report envelope")
     workload=report.get("workload")
@@ -327,7 +337,7 @@ def validate_report(report,kind):
     if not isinstance(inventory_value,dict): raise ValueError("workload inventory missing")
     paths=inventory_value.get("paths")
     if not isinstance(paths,list) or not paths or any(not isinstance(x,str) or not x for x in paths) or paths!=sorted(set(paths)): raise ValueError("workload inventory paths are not sorted, unique and nonempty")
-    if inventory_value.get("count")!=len(paths) or inventory_value.get("sha256")!=path_digest(paths): raise ValueError("workload inventory digest/count mismatch")
+    if nonnegative_integer(inventory_value.get("count"),"workload inventory count")!=len(paths) or inventory_value.get("sha256")!=path_digest(paths): raise ValueError("workload inventory digest/count mismatch")
     shards=workload.get("shardCount"); iterations=workload.get("iterations"); warmups=workload.get("warmups")
     if isinstance(shards,bool) or not isinstance(shards,int) or shards<1 or isinstance(iterations,bool) or not isinstance(iterations,int) or iterations<1 or isinstance(warmups,bool) or not isinstance(warmups,int) or warmups!=1: raise ValueError("workload fanout counts are invalid")
     if workload.get("platform")!="linux/arm64" or workload.get("cachePosture")!=CACHE_POSTURE: raise ValueError("workload platform/cache posture mismatch")
@@ -359,7 +369,8 @@ def validate_report(report,kind):
             if wall<=0 or prepare_wall+execution_wall!=wall: raise ValueError("Kubernetes fanout wall decomposition mismatch")
             nonnegative_number(record.get("submissionWallMs"),"Kubernetes submission wall")
             prepare=record.get("prepare")
-            if not isinstance(prepare,dict) or prepare.get("childCount")!=shards or not isinstance(prepare.get("timingsMs"),dict): raise ValueError("Kubernetes prepare record mismatch")
+            if not isinstance(prepare,dict) or not isinstance(prepare.get("timingsMs"),dict): raise ValueError("Kubernetes prepare record mismatch")
+            if nonnegative_integer(prepare.get("childCount"),"Kubernetes prepare child count")!=shards: raise ValueError("Kubernetes prepare child count mismatch")
             run_save=nonnegative_number(prepare["timingsMs"].get("runSave"),"Kubernetes runSave"); fork=nonnegative_number(prepare["timingsMs"].get("fork"),"Kubernetes fork")
             if run_save+fork!=prepare_wall: raise ValueError("Kubernetes prepare timings mismatch")
             validate_report_shards(record.get("shards"),workload,run_id=run_id)

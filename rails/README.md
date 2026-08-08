@@ -192,9 +192,10 @@ docker buildx imagetools inspect \
   "ghcr.io/sporevm/examples-rails-rspec:sha-${revision}"
 ```
 
-The publisher refuses dirty checkouts and any tag other than
-`sha-<full commit>`, and bakes that revision into the OCI label and workload
-markers. Use the resulting
+The publisher refuses dirty checkouts, non-ARM64 platforms, and any tag other
+than `sha-<full commit>`. It builds from a `git archive` of that exact revision,
+so ignored or untracked working-tree files cannot enter the image, and bakes the
+revision into the OCI label and workload markers. Use the resulting
 `ghcr.io/sporevm/examples-rails-rspec@sha256:...` in all commands; the benchmark
 deliberately refuses tags.
 

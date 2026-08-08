@@ -127,7 +127,7 @@ class BenchmarkTest(unittest.TestCase):
             rows=[]
             for index in range(2):
                 selected=bench.shard_paths(paths,index,2)
-                row={"index":index,"selectedCount":len(selected),"selectedSha256":bench.path_digest(selected),"executionMs":1,"sourceRevision":workload["revision"]}
+                row={"index":index,"selectedCount":len(selected),"selectedSha256":bench.path_digest(selected),"executionMs":1,"sourceRevision":workload["revision"],"setupMs":{"initdb_ms":1,"postgres_ms":2,"schema_ms":3,"before_preload_ms":7}}
                 if docker: row.update(processWallMs=2,exitCode=0)
                 else: row.update(childID=index,attemptID=f"{run_id}-child-{index}-attempt-01")
                 rows.append(row)
@@ -159,8 +159,10 @@ class BenchmarkTest(unittest.TestCase):
     def test_comparison_requires_complete_fanout_evidence(self):
         mutations=(
             lambda a,b: a["fanouts"][0]["shards"].pop(),
+            lambda a,b: a["fanouts"][0]["shards"][0].pop("setupMs"),
             lambda a,b: b["iterations"][1].update(fanoutWallMs=99),
             lambda a,b: b["iterations"][0]["shards"][0].update(attemptID="wrong"),
+            lambda a,b: b["iterations"][0]["shards"][1].update(index=True,childID=True),
             lambda a,b: b.update(coordinatorRuntimeImage="example.com/runtime:latest"),
         )
         for mutate in mutations:
