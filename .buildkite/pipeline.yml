@@ -13,6 +13,7 @@ steps:
       test -z "$$(git status --porcelain)"
       case "$$(uname -m)" in arm64|aarch64) ;; *) echo "worker is not ARM64" >&2; exit 1 ;; esac
       registry_name="sporevm-examples-registry-$${BUILDKITE_JOB_ID%%-*}"
+      capture_name="$${registry_name}-capture"
       artifact_dir=""
       archive=""
       publish_context=""
@@ -26,6 +27,7 @@ steps:
         if [[ -n "$${image_tag}" ]]; then
           docker image rm -f "$${image_tag}" >/dev/null 2>&1 || true
         fi
+        docker rm -f "$${capture_name}" >/dev/null 2>&1 || true
         docker rm -f "$${registry_name}" >/dev/null 2>&1 || true
         rm -rf "$${artifact_dir}" "$${publish_context}"
       }
@@ -73,6 +75,17 @@ steps:
         --volume "$${PWD}/tests/test_sporevm_rspec_shard.rb:/tmp/test_sporevm_rspec_shard.rb:ro" \
         "$${image_tag}" \
         /tmp/test_sporevm_rspec_shard.rb
+      set +e
+      capture_output="$$(timeout --signal=TERM --kill-after=5s 30s docker run --rm \
+        --name "$${capture_name}" \
+        "$${image_tag}" \
+        /bin/bash /usr/local/bin/sporevm-rails-coordinator --capture-delay 1 2>&1)"
+      capture_status="$$?"
+      set -e
+      printf '%s\n' "$${capture_output}"
+      test "$${capture_status}" -eq 1
+      grep -Eq '^SPOREVM_RAILS_READY pid=[0-9]+ capture_delay=1$$' <<<"$${capture_output}"
+      grep -Fqx 'missing SporeVM fanout identity in /run/sporevm/env or /run/sporevm/generation.json' <<<"$${capture_output}"
       docker push "$${image_tag}" >/dev/null
 
       digest="$$(docker run --rm --network host \
