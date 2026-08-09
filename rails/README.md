@@ -18,7 +18,9 @@ runtime state in guest RAM. PostgreSQL initialization and schema load happen
 once before capture, and the parent validates that Rails and RSpec eager-load.
 Each child starts its own postmaster from the cleanly stopped, schema-loaded seed
 and executes a fresh Ruby/Rails shard process because child commands do not
-inherit the coordinator's processes.
+inherit the coordinator's process context. The captured coordinator remains
+parked after publishing readiness so its shell cleanup cannot race the fresh
+child command or stop the child's private postmaster.
 
 ## Prerequisites
 
@@ -116,7 +118,10 @@ spore run --image local/sporevm-rails-rspec:dev --save rails-rspec.spore --save-
   /bin/bash /usr/local/bin/sporevm-rails-coordinator
 
 spore fork rails-rspec.spore --count 4 --out rails-rspec.children
-spore fanout rails-rspec.children
+for child in rails-rspec.children/*; do
+  spore run --from "${child}" -- /usr/local/bin/sporevm-rspec-shard &
+done
+wait
 ```
 
 Expected output includes the warm marker from the parent:
@@ -126,7 +131,7 @@ SPOREVM_POSTGRES_SEED state=stopped duration_ms=...
 SPOREVM_RAILS_READY pid=... capture_delay=2
 ```
 
-and one successful RSpec completion marker per child:
+and `fanout-rspec` prefixes one successful RSpec completion marker per child:
 
 ```text
 [000000] SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=...

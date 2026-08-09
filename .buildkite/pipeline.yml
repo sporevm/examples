@@ -75,18 +75,30 @@ steps:
         --volume "$${PWD}/tests/test_sporevm_rspec_shard.rb:/tmp/test_sporevm_rspec_shard.rb:ro" \
         "$${image_tag}" \
         /tmp/test_sporevm_rspec_shard.rb
-      set +e
-      capture_output="$$(timeout --signal=TERM --kill-after=5s 30s docker run --rm \
+      docker run -d \
         --name "$${capture_name}" \
         "$${image_tag}" \
-        /bin/bash /usr/local/bin/sporevm-rails-coordinator --capture-delay 1 2>&1)"
-      capture_status="$$?"
-      set -e
+        /bin/bash /usr/local/bin/sporevm-rails-coordinator --capture-delay 1 >/dev/null
+      capture_ready=0
+      for attempt in $$(seq 1 300); do
+        capture_output="$$(docker logs "$${capture_name}" 2>&1)"
+        if grep -Eq '^SPOREVM_RAILS_READY pid=[0-9]+ capture_delay=1$$' <<<"$${capture_output}"; then
+          capture_ready=1
+          break
+        fi
+        test "$$(docker inspect --format '{{.State.Running}}' "$${capture_name}")" = true
+        sleep 0.1
+      done
+      test "$${capture_ready}" -eq 1
+      sleep 2
+      capture_output="$$(docker logs "$${capture_name}" 2>&1)"
       printf '%s\n' "$${capture_output}"
-      test "$${capture_status}" -eq 1
-      grep -Eq '^SPOREVM_POSTGRES_SEED state=stopped duration_ms=[0-9]+$$' <<<"$${capture_output}"
-      grep -Eq '^SPOREVM_RAILS_READY pid=[0-9]+ capture_delay=1$$' <<<"$${capture_output}"
-      grep -Fqx 'missing SporeVM fanout identity in /run/sporevm/env or /run/sporevm/generation.json' <<<"$${capture_output}"
+      test "$$(docker inspect --format '{{.State.Running}}' "$${capture_name}")" = true
+      test "$$(grep -Ec '^SPOREVM_POSTGRES_SEED state=stopped duration_ms=[0-9]+$$' <<<"$${capture_output}")" -eq 1
+      test "$$(grep -Ec '^SPOREVM_RAILS_READY pid=[0-9]+ capture_delay=1$$' <<<"$${capture_output}")" -eq 1
+      ! grep -Fq 'SPOREVM_RAILS_RESUMED' <<<"$${capture_output}"
+      test "$$(grep -n '^SPOREVM_POSTGRES_SEED ' <<<"$${capture_output}" | cut -d: -f1)" -lt \
+        "$$(grep -n '^SPOREVM_RAILS_READY ' <<<"$${capture_output}" | cut -d: -f1)"
       docker push "$${image_tag}" >/dev/null
 
       digest="$$(docker run --rm --network host \
