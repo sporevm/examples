@@ -18,7 +18,7 @@ Options:
   --backend hvf|kvm       Backend to use (default: infer from host)
   --memory VALUE          Guest RAM, e.g. 512mb or 2gb (default: 2gb)
   --capture-delay N       Guest seconds to wait after ready before tests (default: 2)
-  --fanout-timeout N      Host seconds before fanout is killed (default: 300)
+  --fanout-timeout N      Host seconds before child runs are killed (default: 300)
   --workdir DIR           Directory for logs and spores (default: mktemp)
   --spore-bin PATH        spore CLI to use (default: $SPORE_BIN or spore on PATH)
   --kernel PATH           Custom run kernel Image (default: managed kernel)
@@ -207,20 +207,31 @@ fi
 
 run_pid=""
 watchdog_pid=""
-fanout_pid=""
+child_pids=()
+signal_child_jobs() {
+  local signal="$1"
+  local child_pid
+  local running_pids
+  running_pids="$(jobs -pr)"
+  for child_pid in "${child_pids[@]}"; do
+    if grep -Fxq "${child_pid}" <<<"${running_pids}"; then
+      kill -"${signal}" "${child_pid}" >/dev/null 2>&1 || true
+    fi
+  done
+}
 cleanup() {
   if [[ -n "${run_pid}" ]]; then
     kill -TERM "${run_pid}" >/dev/null 2>&1 || true
     wait "${run_pid}" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${fanout_pid}" ]]; then
-    kill -TERM "${fanout_pid}" >/dev/null 2>&1 || true
-    wait "${fanout_pid}" >/dev/null 2>&1 || true
-  fi
   if [[ -n "${watchdog_pid}" ]]; then
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
     wait "${watchdog_pid}" >/dev/null 2>&1 || true
   fi
+  signal_child_jobs TERM
+  for child_pid in "${child_pids[@]}"; do
+    wait "${child_pid}" >/dev/null 2>&1 || true
+  done
 }
 trap cleanup EXIT
 
@@ -268,18 +279,11 @@ fanout_stdout="${workdir}/fanout.stdout"
 fanout_stderr="${workdir}/fanout.stderr"
 fork_stdout="${workdir}/fork.stdout"
 fork_stderr="${workdir}/fork.stderr"
+child_stdout=()
+child_stderr=()
 
 rm -rf -- "${capture_dir}" "${fork_dir}"
 rm -f -- "${run_stdout}" "${run_stderr}" "${fanout_stdout}" "${fanout_stderr}" "${fork_stdout}" "${fork_stderr}"
-
-all_shards_done() {
-  local i child_name
-  for i in $(seq 0 $((count - 1))); do
-    child_name="$(printf "%06d" "${i}")"
-    grep -Eaq "\\[${child_name}\\].*SPOREVM_RSPEC_DONE parallel_index=${i} parallel_count=${count} exit=0" "${fanout_stdout}" || return 1
-  done
-  return 0
-}
 
 phase "warm Rails/Postgres and capture"
 phase_start="${SECONDS}"
@@ -363,36 +367,57 @@ fork_seconds="$(elapsed_since "${phase_start}")"
 
 phase "resume children and run RSpec"
 phase_start="${SECONDS}"
-set +e
-"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" \
-  >"${fanout_stdout}" 2>"${fanout_stderr}" &
-fanout_pid="$!"
-fanout_completed=0
+for i in $(seq 0 $((count - 1))); do
+  child_name="$(printf "%06d" "${i}")"
+  child_stdout[$i]="${workdir}/child-${child_name}.stdout"
+  child_stderr[$i]="${workdir}/child-${child_name}.stderr"
+  "${spore_bin}" run --backend "${backend}" --from "${fork_dir}/${child_name}" \
+    -- /usr/local/bin/sporevm-rspec-shard \
+    >"${child_stdout[$i]}" 2>"${child_stderr[$i]}" &
+  child_pids[$i]="$!"
+done
+
+fanout_timed_out=0
 for _ in $(seq 1 "${fanout_timeout}"); do
-  if all_shards_done; then
-    fanout_completed=1
-    kill -TERM "${fanout_pid}" >/dev/null 2>&1 || true
-    break
-  fi
-  if ! kill -0 "${fanout_pid}" >/dev/null 2>&1; then
+  if [[ -z "$(jobs -pr)" ]]; then
     break
   fi
   sleep 1
 done
-if [[ "${fanout_completed}" != "1" ]] && kill -0 "${fanout_pid}" >/dev/null 2>&1; then
-  kill -TERM "${fanout_pid}" >/dev/null 2>&1 || true
+if [[ -n "$(jobs -pr)" ]]; then
+  fanout_timed_out=1
+  signal_child_jobs TERM
   sleep 5
-  kill -KILL "${fanout_pid}" >/dev/null 2>&1 || true
+  signal_child_jobs KILL
 fi
-wait "${fanout_pid}" 2>/dev/null
-fanout_rc="$?"
-set -e
-fanout_pid=""
 
+fanout_rc=0
+set +e
+for child_pid in "${child_pids[@]}"; do
+  wait "${child_pid}"
+  child_rc="$?"
+  if [[ "${child_rc}" != "0" ]]; then
+    fanout_rc=1
+  fi
+done
+set -e
+child_pids=()
+
+: >"${fanout_stdout}"
+: >"${fanout_stderr}"
+for i in $(seq 0 $((count - 1))); do
+  child_name="$(printf "%06d" "${i}")"
+  sed "s/^/[${child_name}] /" "${child_stdout[$i]}" >>"${fanout_stdout}"
+  sed "s/^/[${child_name}] /" "${child_stderr[$i]}" >>"${fanout_stderr}"
+done
 cat "${fanout_stdout}"
-if [[ "${fanout_rc}" != "0" ]] && ! all_shards_done; then
+if [[ "${fanout_timed_out}" == "1" ]]; then
   cat "${fanout_stderr}" >&2 || true
-  die "spore fanout exited ${fanout_rc}"
+  die "parallel spore run timed out after ${fanout_timeout}s"
+fi
+if [[ "${fanout_rc}" != "0" ]]; then
+  cat "${fanout_stderr}" >&2 || true
+  die "one or more parallel spore run commands failed"
 fi
 
 for i in $(seq 0 $((count - 1))); do

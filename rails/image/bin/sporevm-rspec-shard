@@ -436,10 +436,9 @@ def preload_for_capture(capture_delay)
   puts "SPOREVM_RAILS_READY pid=#{Process.pid} capture_delay=#{capture_delay}"
   STDOUT.flush
 
-  sleep capture_delay
-
-  puts "SPOREVM_RAILS_RESUMED pid=#{Process.pid}"
-  STDOUT.flush
+  # `run --from` resumes this session beside the fresh shard command. Keep the
+  # coordinator parked so its shell EXIT trap cannot stop that shard's server.
+  loop { sleep 3600 }
 end
 
 def run_specs(selected)
