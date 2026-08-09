@@ -45,6 +45,7 @@ class SporevmRspecShardTest < Minitest::Test
   def test_context_round_trip_is_strict_and_mode_0600
     Dir.mktmpdir do |directory|
       populate_context_env
+      assert_equal File.join("/usr/local/bundle/ruby", RbConfig::CONFIG.fetch("ruby_version")), ENV.fetch("GEM_HOME")
       Dir.chdir(directory)
       path = File.join(directory, "child-context.json")
       expected = CHILD_CONTEXT_ENV.to_h { |key| [key, ENV.fetch(key)] }

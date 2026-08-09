@@ -3,6 +3,7 @@
 
 require "json"
 require "digest"
+require "rbconfig"
 
 IDENTITY_ENV = "/run/sporevm/env"
 IDENTITY_JSON = "/run/sporevm/generation.json"
@@ -29,7 +30,7 @@ CHILD_CONTEXT_FIXED_ENV = {
   "HOME" => "/tmp/sporevm-home",
   "LANG" => "C.UTF-8",
   "PATH" => "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-  "GEM_HOME" => "/usr/local/bundle",
+  "GEM_HOME" => File.join("/usr/local/bundle/ruby", RbConfig::CONFIG.fetch("ruby_version")),
   "BUNDLE_GEMFILE" => "/tmp/sporevm-rails/app/Gemfile",
   "BUNDLE_PATH" => "/usr/local/bundle",
   "BUNDLE_WITHOUT" => "development",
