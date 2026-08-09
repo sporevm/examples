@@ -61,10 +61,13 @@ else
   pg_bin="$(find /usr/lib/postgresql -path '*/bin/initdb' -type f | sort | tail -n 1)"
   pg_bin="$(dirname "${pg_bin}")"
 fi
-if [[ -z "${pg_bin}" || ! -x "${pg_bin}/initdb" ]]; then
-  echo "postgres initdb not found" >&2
-  exit 1
-fi
+for postgres_tool in createdb initdb pg_controldata pg_ctl pg_isready postgres psql; do
+  if [[ -z "${pg_bin}" || ! -x "${pg_bin}/${postgres_tool}" ]]; then
+    echo "postgres tool not found: ${postgres_tool}" >&2
+    exit 1
+  fi
+done
+export SPOREVM_POSTGRES_BIN="${pg_bin}"
 export PATH="${pg_bin}:${PATH}"
 
 mkdir -p "${HOME}" "${SPOREVM_RAILS_RUNTIME_ROOT}" /tmp/sporevm-postgres/data /tmp/sporevm-postgres/run /tmp/sporevm-postgres/log

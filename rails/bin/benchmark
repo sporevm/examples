@@ -9,7 +9,7 @@ COMPARISON_SCHEMA = "sporevm-examples.rails-rspec-benchmark-comparison.v3"
 ROOT = Path(__file__).resolve().parents[2]
 SPEC_ROOT = ROOT / "rails" / "app"
 DIGEST_REF = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
-MARKER_LINE = re.compile(r"^(SPOREVM_(?:RSPEC_SHARD|RSPEC_DONE|RAILS_WARM_TIMING))\s+(.+)$")
+MARKER_LINE = re.compile(r"^(SPOREVM_(?:RSPEC_SHARD|RSPEC_DONE|RAILS_WARM_TIMING|POSTGRES_RESUME))\s+(.+)$")
 CACHE_POSTURE = "warm-resident-v1: digest image prefetch outside timing; identical excluded warmups; caches remain resident"
 
 def now(): return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -49,7 +49,7 @@ def parse_fields(raw):
         if not k or not v or k in fields: raise ValueError("malformed or duplicate marker field")
         fields[k]=v
     return fields
-def parse_markers(output, index=None, count=None, revision=None, require_warm=True):
+def parse_markers(output, index=None, count=None, revision=None, require_warm=True, require_resume=False):
     found={}
     for line in output.splitlines():
         m=MARKER_LINE.fullmatch(line.strip())
@@ -58,6 +58,7 @@ def parse_markers(output, index=None, count=None, revision=None, require_warm=Tr
         found[m.group(1)]=parse_fields(m.group(2))
     required=["SPOREVM_RSPEC_SHARD","SPOREVM_RSPEC_DONE"]
     if require_warm: required.append("SPOREVM_RAILS_WARM_TIMING")
+    if require_resume: required.append("SPOREVM_POSTGRES_RESUME")
     if any(x not in found for x in required): raise ValueError("missing required benchmark marker")
     shard,done=found["SPOREVM_RSPEC_SHARD"],found["SPOREVM_RSPEC_DONE"]
     si,sc=integer(shard,"parallel_index"),integer(shard,"parallel_count")
@@ -77,6 +78,10 @@ def parse_markers(output, index=None, count=None, revision=None, require_warm=Tr
     if require_warm:
         warm=found["SPOREVM_RAILS_WARM_TIMING"]
         result["setupMs"]={k:integer(warm,k) for k in ("initdb_ms","postgres_ms","schema_ms","before_preload_ms")}
+    if require_resume:
+        resume=found["SPOREVM_POSTGRES_RESUME"]
+        if set(resume)!={"action","status","duration_ms"} or resume.get("action")!="started" or resume.get("status")!="ready": raise ValueError("invalid PostgreSQL resume marker")
+        result["postgresResumeMs"]=integer(resume,"duration_ms")
     return result
 def validate_assignment(parsed, paths, index, count, revision):
     expected=shard_paths(paths,index,count)
@@ -136,7 +141,7 @@ def parse_terminal_results(text, run_id, shards, paths, revision):
             except Exception as exc: raise ValueError("malformed output preview") from exc
             if len(raw)!=total: raise ValueError("truncated output preview")
             chunks.append(raw.decode("utf-8","strict"))
-        parsed=parse_markers("\n".join(chunks),child,shards,revision); validate_assignment(parsed,paths,child,shards,revision)
+        parsed=parse_markers("\n".join(chunks),child,shards,revision,require_resume=True); validate_assignment(parsed,paths,child,shards,revision)
         results[child]={**parsed,"childID":child,"attemptID":obj.get("attemptID")}
     if set(results)!=set(range(shards)): raise ValueError("missing terminal child results")
     return [results[i] for i in range(shards)]
@@ -329,6 +334,7 @@ def validate_report_shards(rows,workload,run_id=None,docker=False):
         elif (isinstance(row.get("childID"),bool) or not isinstance(row.get("childID"),int) or
               row["childID"]!=index or row.get("attemptID")!=f"{run_id}-child-{index}-attempt-01"):
             raise ValueError("Kubernetes shard attempt identity mismatch")
+        else: nonnegative_integer(row.get("postgresResumeMs"),f"Kubernetes shard {index} postgresResumeMs")
 def validate_report(report,kind):
     if report.get("schema")!=SCHEMA or report.get("schemaVersion")!=3 or report.get("kind")!=kind or report.get("success") is not True: raise ValueError(f"invalid {kind} report envelope")
     workload=report.get("workload")

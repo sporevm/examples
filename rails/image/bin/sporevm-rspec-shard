@@ -3,12 +3,14 @@
 
 require "json"
 require "digest"
+require "open3"
 require "rbconfig"
+require "tempfile"
 
 IDENTITY_ENV = "/run/sporevm/env"
 IDENTITY_JSON = "/run/sporevm/generation.json"
 CHILD_CONTEXT = "/tmp/sporevm-rails/child-context.json"
-CHILD_CONTEXT_SCHEMA = "sporevm-rails-child-context.v1"
+CHILD_CONTEXT_SCHEMA = "sporevm-rails-child-context.v2"
 CHILD_CONTEXT_ENV = %w[
   HOME
   LANG
@@ -20,6 +22,7 @@ CHILD_CONTEXT_ENV = %w[
   RAILS_ENV
   RACK_ENV
   SPOREVM_SOURCE_REVISION
+  SPOREVM_POSTGRES_BIN
   SPOREVM_RAILS_RUNTIME_ROOT
   SPOREVM_RAILS_INITDB_MS
   SPOREVM_RAILS_POSTGRES_MS
@@ -41,6 +44,13 @@ CHILD_CONTEXT_FIXED_ENV = {
 CHILD_CONTEXT_CWD = "/tmp/sporevm-rails/app"
 CHILD_CONTEXT_REEXEC_ARG = "--sporevm-child-context-loaded"
 CHILD_RUBY = "/usr/local/bin/ruby"
+POSTGRES_DATA = "/tmp/sporevm-postgres/data"
+POSTGRES_SOCKET_DIR = "/tmp/sporevm-postgres/run"
+POSTGRES_LOG_DIR = "/tmp/sporevm-postgres/log"
+POSTGRES_DATABASE = "sporevm_rails_test"
+POSTGRES_PORT = "5432"
+POSTGRES_START_TIMEOUT = 15
+SU_EXEC = "/sbin/su-exec"
 
 def child_context_payload(cwd: Dir.pwd, env: ENV)
   {
@@ -65,6 +75,10 @@ def validate_child_context(context, expected_cwd: CHILD_CONTEXT_CWD)
   end
   unless environment.fetch("SPOREVM_SOURCE_REVISION").match?(/\A[0-9a-f]{40}\z/)
     abort "invalid Rails child context source revision"
+  end
+  postgres_bin = environment.fetch("SPOREVM_POSTGRES_BIN")
+  unless postgres_bin.match?(%r{\A/[A-Za-z0-9_+./-]+\z}) && File.expand_path(postgres_bin) == postgres_bin && postgres_bin.bytesize <= 255
+    abort "invalid Rails child context PostgreSQL path"
   end
   %w[
     SPOREVM_RAILS_INITDB_MS
@@ -104,6 +118,189 @@ def load_child_context(path, expected_cwd: CHILD_CONTEXT_CWD)
   Dir.chdir(context["cwd"])
 rescue JSON::ParserError, SystemCallError
   abort "could not load Rails child context"
+end
+
+def monotonic_ms
+  (Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000).round
+end
+
+def postgres_tool(name)
+  abort "invalid PostgreSQL tool" unless %w[pg_controldata pg_ctl pg_isready postgres psql].include?(name)
+
+  path = File.join(ENV.fetch("SPOREVM_POSTGRES_BIN"), name)
+  abort "PostgreSQL tool is unavailable: #{name}" unless File.file?(path) && File.executable?(path)
+
+  path
+end
+
+def postgres_command(*command)
+  abort "su-exec is unavailable" unless File.file?(SU_EXEC) && File.executable?(SU_EXEC)
+
+  [SU_EXEC, "postgres", *command]
+end
+
+def command_output(command, environment = {})
+  Open3.capture3(environment, *command)
+rescue SystemCallError => error
+  ["", error.message, nil]
+end
+
+def wait_for_process(pid, deadline)
+  loop do
+    result = Process.wait2(pid, Process::WNOHANG)
+    return result.last if result
+    return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+    sleep 0.02
+  end
+end
+
+def terminate_process_group(pid)
+  Process.kill("TERM", -pid)
+  status = wait_for_process(pid, Process.clock_gettime(Process::CLOCK_MONOTONIC) + 0.5)
+  return status if status
+
+  Process.kill("KILL", -pid)
+  Process.wait2(pid).last
+rescue Errno::ESRCH
+  Process.wait2(pid).last
+rescue Errno::ECHILD
+  nil
+end
+
+def bounded_command_output(command, environment = {}, timeout_seconds:)
+  pid = nil
+  status = nil
+  timed_out = false
+  output = nil
+  Tempfile.create("sporevm-postgres-stdout") do |stdout|
+    Tempfile.create("sporevm-postgres-stderr") do |stderr|
+      pid = Process.spawn(environment, *command, out: stdout, err: stderr, pgroup: true)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
+      status = wait_for_process(pid, deadline)
+      unless status
+        timed_out = true
+        status = terminate_process_group(pid)
+      end
+      stdout.rewind
+      stderr.rewind
+      error_output = stderr.read(4096)
+      error_output = "#{error_output}\ncommand timed out" if timed_out
+      output = [stdout.read(4096), error_output, status]
+    end
+  end
+  output
+rescue SystemCallError => error
+  ["", error.message, nil]
+ensure
+  terminate_process_group(pid) if pid && !status
+end
+
+def command_detail(*chunks)
+  detail = chunks.join(" ").encode("UTF-8", invalid: :replace, undef: :replace, replace: "?")
+  detail = detail.gsub(/\s+/, " ").strip
+  detail.empty? ? "unavailable" : detail.byteslice([detail.bytesize - 512, 0].max, 512)
+end
+
+def postgres_process_pids(proc_root: "/proc")
+  abort "cannot inspect PostgreSQL processes" unless Dir.exist?(proc_root)
+
+  target = File.realpath(postgres_tool("postgres"))
+  Dir.children(proc_root).filter_map do |entry|
+    next unless entry.match?(/\A\d+\z/)
+
+    process_name = File.read(File.join(proc_root, entry, "comm")).strip
+    next unless %w[postgres postmaster].include?(process_name)
+
+    executable = File.realpath(File.join(proc_root, entry, "exe"))
+    Integer(entry, 10) if executable == target
+  rescue Errno::EACCES
+    abort "cannot inspect PostgreSQL processes"
+  rescue Errno::ENOENT
+    nil
+  end
+end
+
+def stop_postgres_seed
+  started = monotonic_ms
+  command = postgres_command(
+    postgres_tool("pg_ctl"), "-D", POSTGRES_DATA,
+    "-m", "fast", "-w", "-t", POSTGRES_START_TIMEOUT.to_s, "stop"
+  )
+  stdout, stderr, status = command_output(command)
+  unless status&.success?
+    puts "SPOREVM_POSTGRES_SEED state=failed reason=shutdown"
+    warn "PostgreSQL seed shutdown failed: #{command_detail(stdout, stderr)}"
+    abort "could not stop PostgreSQL before capture"
+  end
+  abort "could not sync PostgreSQL seed" unless system("/bin/sync", out: File::NULL, err: File::NULL)
+
+  control_stdout, control_stderr, control_status = command_output(
+    postgres_command(postgres_tool("pg_controldata"), POSTGRES_DATA)
+  )
+  unless control_status&.success? && control_stdout.match?(/^Database cluster state:\s+shut down\s*$/)
+    puts "SPOREVM_POSTGRES_SEED state=failed reason=control"
+    warn "PostgreSQL seed state invalid: #{command_detail(control_stdout, control_stderr)}"
+    abort "PostgreSQL seed is not cleanly shut down"
+  end
+
+  residual_paths = [
+    File.join(POSTGRES_DATA, "postmaster.pid"),
+    File.join(POSTGRES_SOCKET_DIR, ".s.PGSQL.5432"),
+    File.join(POSTGRES_SOCKET_DIR, ".s.PGSQL.5432.lock")
+  ].select { |path| File.exist?(path) }
+  abort "PostgreSQL seed retained runtime files" unless residual_paths.empty?
+  abort "PostgreSQL seed retained live processes" unless postgres_process_pids.empty?
+
+  puts "SPOREVM_POSTGRES_SEED state=stopped duration_ms=#{monotonic_ms - started}"
+end
+
+def postgres_ready?
+  _, _, ready_status = bounded_command_output(
+    [
+      postgres_tool("pg_isready"), "-q", "-h", POSTGRES_SOCKET_DIR,
+      "-p", POSTGRES_PORT, "-d", POSTGRES_DATABASE, "-U", "postgres", "-t", "1"
+    ],
+    timeout_seconds: 3
+  )
+  return false unless ready_status&.success?
+
+  stdout, _, identity_status = bounded_command_output(
+    [
+      postgres_tool("psql"), "-XAtqw", "-h", POSTGRES_SOCKET_DIR,
+      "-p", POSTGRES_PORT, "-d", POSTGRES_DATABASE, "-U", "postgres", "-v", "ON_ERROR_STOP=1",
+      "-c", "SELECT current_database(), current_setting('data_directory')"
+    ],
+    {"PGCONNECT_TIMEOUT" => "2", "PGOPTIONS" => "-c statement_timeout=2000"},
+    timeout_seconds: 3
+  )
+  identity_status&.success? && stdout.strip == "#{POSTGRES_DATABASE}|#{POSTGRES_DATA}"
+end
+
+def resume_postgres(proc_root: "/proc")
+  started = monotonic_ms
+  live_pids = postgres_process_pids(proc_root: proc_root)
+  unless live_pids.empty?
+    puts "SPOREVM_POSTGRES_RESUME action=refused status=failed reason=live_unavailable"
+    abort "a PostgreSQL process is live but unavailable"
+  end
+
+  stdout, stderr, status = command_output(postgres_command(
+    postgres_tool("pg_ctl"), "-D", POSTGRES_DATA,
+    "-l", File.join(POSTGRES_LOG_DIR, "postgres-resume.log"),
+    "-w", "-t", POSTGRES_START_TIMEOUT.to_s, "start"
+  ))
+  unless status&.success?
+    puts "SPOREVM_POSTGRES_RESUME action=started status=failed reason=startup"
+    warn "PostgreSQL resume failed: #{command_detail(stdout, stderr)}"
+    abort "could not resume PostgreSQL"
+  end
+  unless postgres_ready?
+    puts "SPOREVM_POSTGRES_RESUME action=started status=failed reason=identity"
+    abort "resumed PostgreSQL identity is invalid"
+  end
+
+  puts "SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=#{monotonic_ms - started}"
 end
 
 def parse_args(argv)
@@ -235,6 +432,7 @@ def preload_for_capture(capture_delay)
 
   puts "rails preload ok"
   puts "SPOREVM_RAILS_PRELOAD_TIMING preload=#{format('%.3f', preload_seconds)}s"
+  stop_postgres_seed
   puts "SPOREVM_RAILS_READY pid=#{Process.pid} capture_delay=#{capture_delay}"
   STDOUT.flush
 
@@ -278,6 +476,7 @@ def main
   if parallel_index.negative? || parallel_index >= parallel_count
     abort "invalid SPORE_PARALLEL_JOB=#{parallel_index} for count #{parallel_count}"
   end
+  resume_postgres if child_context_loaded
 
   specs = Dir["spec/**/*_spec.rb"].sort
   selected = specs.each_with_index.select { |_path, i| (i % parallel_count) == parallel_index }.map(&:first)

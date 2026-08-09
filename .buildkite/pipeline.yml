@@ -84,6 +84,7 @@ steps:
       set -e
       printf '%s\n' "$${capture_output}"
       test "$${capture_status}" -eq 1
+      grep -Eq '^SPOREVM_POSTGRES_SEED state=stopped duration_ms=[0-9]+$$' <<<"$${capture_output}"
       grep -Eq '^SPOREVM_RAILS_READY pid=[0-9]+ capture_delay=1$$' <<<"$${capture_output}"
       grep -Fqx 'missing SporeVM fanout identity in /run/sporevm/env or /run/sporevm/generation.json' <<<"$${capture_output}"
       docker push "$${image_tag}" >/dev/null
