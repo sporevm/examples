@@ -13,7 +13,8 @@ steps:
       test -z "$$(git status --porcelain)"
       case "$$(uname -m)" in arm64|aarch64) ;; *) echo "worker is not ARM64" >&2; exit 1 ;; esac
       registry_name="sporevm-examples-registry-$${BUILDKITE_JOB_ID%%-*}"
-      archive="rails-rspec-linux-arm64.oci"
+      artifact_dir=""
+      archive=""
       publish_context=""
       image_tag=""
       image_ref=""
@@ -26,11 +27,13 @@ steps:
           docker image rm -f "$${image_tag}" >/dev/null 2>&1 || true
         fi
         docker rm -f "$${registry_name}" >/dev/null 2>&1 || true
-        rm -rf "$${publish_context}"
+        rm -rf "$${artifact_dir}" "$${publish_context}"
       }
       trap cleanup EXIT
       cleanup
-      publish_context="$$(mktemp -d "$${TMPDIR:-/tmp}/sporevm-rails-publish.XXXXXX")"
+      artifact_dir="$$(mktemp -d "/tmp/sporevm-rails-artifacts.XXXXXX")"
+      archive="$${artifact_dir}/rails-rspec-linux-arm64.oci"
+      publish_context="$$(mktemp -d "/tmp/sporevm-rails-publish.XXXXXX")"
 
       docker run -d --name "$${registry_name}" \
         --publish 127.0.0.1::5000 \
@@ -65,27 +68,29 @@ steps:
         "$${publish_context}"
       test "$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$${image_tag}")" = "linux/arm64"
       docker push "$${image_tag}" >/dev/null
-      docker pull "$${image_tag}" >/dev/null
 
-      image_ref="$$(docker image inspect --format '{{index .RepoDigests 0}}' "$${image_tag}")"
-      digest="$${image_ref##*@}"
+      digest="$$(docker run --rm --network host \
+        quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615 \
+        inspect --tls-verify=false --format '{{.Digest}}' \
+        "docker://$${image_tag}")"
       [[ "$${digest}" =~ ^sha256:[0-9a-f]{64}$$ ]] || {
         echo "could not resolve canonical workload digest" >&2
         exit 1
       }
-      test "$${image_ref%@*}" = "$${image_tag%:*}"
+      image_ref="$${image_tag%:*}@$${digest}"
+      docker pull "$${image_ref}" >/dev/null
 
       docker run --rm --network host \
         --user "$$(id -u):$$(id -g)" \
-        --volume "$${PWD}:/workspace" \
+        --volume "$${artifact_dir}:/artifacts" \
         quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615 \
         copy --all --preserve-digests --src-tls-verify=false \
         "docker://$${image_ref}" \
-        "oci-archive:/workspace/$${archive}"
+        "oci-archive:/artifacts/rails-rspec-linux-arm64.oci"
 
-      python3 - "$${archive}" "$${digest}" "$${revision}" "$${image_tag}" <<'PY'
+      python3 - "$${archive}" "$${digest}" "$${revision}" "$${image_tag}" "$${artifact_dir}/rails-rspec-image.json" <<'PY'
       import hashlib, json, sys, tarfile
-      archive, expected_digest, revision, image_tag = sys.argv[1:]
+      archive, expected_digest, revision, image_tag, metadata_path = sys.argv[1:]
       def file_sha256(path):
           digest = hashlib.sha256()
           with open(path, "rb") as source:
@@ -120,7 +125,7 @@ steps:
           "imageDigest": expected_digest,
           "archiveSha256": file_sha256(archive),
       }
-      with open("rails-rspec-image.json", "w") as output:
+      with open(metadata_path, "w") as output:
           json.dump(metadata, output, indent=2, sort_keys=True)
           output.write("\n")
       PY
@@ -130,7 +135,13 @@ steps:
         --shards "$${SPOREVM_RAILS_SHARDS:-4}" \
         --iterations "$${SPOREVM_RAILS_ITERATIONS:-5}" \
         --warmups 1 \
-        --report rails-rspec-buildkite.json
+        --report "$${artifact_dir}/rails-rspec-buildkite.json"
+
+      mv \
+        "$${archive}" \
+        "$${artifact_dir}/rails-rspec-image.json" \
+        "$${artifact_dir}/rails-rspec-buildkite.json" \
+        .
     artifact_paths:
       - rails-rspec-linux-arm64.oci
       - rails-rspec-image.json
