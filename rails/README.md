@@ -216,6 +216,24 @@ standalone comparator permits different transport references but requires the
 same digest, source revision, platform, inventory, shard shape, sample shape,
 and cache posture. Its output records both references and the shared digest.
 
+The checked-in Buildkite pipeline can create that worker-local image, OCI
+archive, provenance record, and Docker benchmark report in one ARM64 job.
+Trigger the `sporevm-examples` pipeline with
+`SPOREVM_RAILS_BUILD_LOCAL=1`. The job builds from the exact clean Git archive,
+pushes to an ephemeral worker-local registry, verifies that the registry and
+OCI archive expose the same Linux ARM64 manifest digest, and uploads:
+
+```text
+rails-rspec-linux-arm64.oci
+rails-rspec-image.json
+rails-rspec-buildkite.json
+```
+
+Copy `rails-rspec-linux-arm64.oci` into the cluster-local registry with a tool
+that fails if the manifest digest cannot be preserved, then independently
+resolve the destination before running the Kubernetes side. The temporary
+worker registry and Buildx builder are removed by the job cleanup trap.
+
 The Docker baseline is one Buildkite job on one `sporevm-linux-arm64` worker.
 It prefetches the image, then starts all N independent containers concurrently
 and measures that local wall itself. This is intentionally **not** Buildkite
