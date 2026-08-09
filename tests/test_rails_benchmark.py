@@ -34,10 +34,11 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(bench.path_digest(paths),hashlib.sha256(b"spec/a_spec.rb\nspec/b_spec.rb\n").hexdigest())
     def test_nearest_rank(self):
         self.assertEqual(bench.percentiles(list(range(1,101))),{"p50":50,"p95":95,"p99":99})
-    def test_image_digest_is_normalized_from_reference(self):
+    def test_image_digest_requires_canonical_reference(self):
         digest="a"*64
-        self.assertEqual(bench.image_digest("one.example/workload@sha256:"+digest.upper()),"sha256:"+digest)
-        with self.assertRaises(ValueError): bench.image_digest("one.example/workload:latest")
+        self.assertEqual(bench.image_digest("one.example/workload@sha256:"+digest),"sha256:"+digest)
+        for image in ("one.example/workload:latest","one.example/workload@sha256:"+digest.upper()):
+            with self.subTest(image=image),self.assertRaises(ValueError): bench.image_digest(image)
     def test_optional_external_buildkite_timings(self):
         with mock.patch.dict(bench.os.environ,{"SPOREVM_BUILDKITE_QUEUE_WAIT_MS":"12.5"},clear=True):
             self.assertEqual(bench.optional_ms_env("SPOREVM_BUILDKITE_QUEUE_WAIT_MS"),12.5)
