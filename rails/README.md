@@ -179,7 +179,7 @@ SPORE_RAILS_CAPTURE_DELAY=2
 
 ## Docker versus Kubernetes benchmark
 
-The published ARM64 workload image is
+The public ARM64 workload image can be published as
 `ghcr.io/sporevm/examples-rails-rspec`. From a clean checkout, publish the exact
 source revision under its immutable tag, then resolve that tag to a manifest
 digest:
@@ -199,6 +199,23 @@ revision into the OCI label and workload markers. Use the resulting
 `ghcr.io/sporevm/examples-rails-rspec@sha256:...` in all commands; the benchmark
 deliberately refuses tags.
 
+The two benchmark environments may use different registry transports for the
+same manifest. For example, the Buildkite worker may use a worker-local
+registry while Kubernetes uses the private cluster-local registry:
+
+```text
+localhost:5000/sporevm/examples-rails-rspec@sha256:<digest>
+spore-registry.sporevm-system.svc.cluster.local:5000/sporevm/examples-rails-rspec@sha256:<digest>
+```
+
+Copy the exact OCI manifest and blobs between those registries without
+rebuilding or converting them, and verify the destination digest after the
+copy. Schema-v3 reports retain each actual reference as `workload.imageRef`,
+derive `workload.imageDigest` from it, and fail if those fields disagree. The
+standalone comparator permits different transport references but requires the
+same digest, source revision, platform, inventory, shard shape, sample shape,
+and cache posture. Its output records both references and the shared digest.
+
 The Docker baseline is one Buildkite job on one `sporevm-linux-arm64` worker.
 It prefetches the image, then starts all N independent containers concurrently
 and measures that local wall itself. This is intentionally **not** Buildkite
@@ -213,11 +230,11 @@ headline runtime ratio.
 
 ```bash
 python3 rails/bin/benchmark buildkite \
-  --image ghcr.io/sporevm/examples-rails-rspec@sha256:<64-hex-digest> \
+  --image localhost:5000/sporevm/examples-rails-rspec@sha256:<64-hex-digest> \
   --shards 4 --iterations 5 --warmups 1 --report /tmp/rails-buildkite.json
 
 python3 rails/bin/benchmark k8s \
-  --image ghcr.io/sporevm/examples-rails-rspec@sha256:<64-hex-digest> \
+  --image spore-registry.sporevm-system.svc.cluster.local:5000/sporevm/examples-rails-rspec@sha256:<64-hex-digest> \
   --runtime-image ghcr.io/sporevm/k8s-runtime@sha256:<64-hex-digest> \
   --shards 4 --iterations 5 --warmups 1 --report /tmp/rails-k8s.json
 
@@ -266,10 +283,12 @@ Defaults match the public chart; `--namespace`,
 `--kubectl`, `--sporectl`, `--runtime-image`, `--result-root`, and
 `--verifier-image` provide explicit deployment overrides.
 
-Only compare successful reports with the same clean Git revision, exact image,
-sorted nonempty inventory, shard/iteration/warmup counts, linux/arm64 platform,
-and cache posture; the comparator enforces all of these boundaries. The initial
+Only compare successful reports with the same clean Git revision, exact image
+digest, sorted nonempty inventory, shard/iteration/warmup counts, linux/arm64
+platform, and cache posture; the comparator enforces all of these boundaries.
+Registry hostnames may differ, but each report must use a digest-pinned
+reference whose digest exactly matches its explicit `imageDigest`. The initial
 topology is one ARM64 Buildkite worker versus one ARM64 Kubernetes agent/node.
 Repeated measured distributions are evidence, not a universal performance
-claim. The report intentionally makes no claim about cluster node CPU or memory. Use
-`--require-k8s-faster` only when a gating assertion is explicitly desired.
+claim. The report intentionally makes no claim about cluster node CPU or memory.
+Use `--require-k8s-faster` only when a gating assertion is explicitly desired.

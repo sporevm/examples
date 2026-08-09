@@ -34,6 +34,11 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(bench.path_digest(paths),hashlib.sha256(b"spec/a_spec.rb\nspec/b_spec.rb\n").hexdigest())
     def test_nearest_rank(self):
         self.assertEqual(bench.percentiles(list(range(1,101))),{"p50":50,"p95":95,"p99":99})
+    def test_image_digest_requires_canonical_reference(self):
+        digest="a"*64
+        self.assertEqual(bench.image_digest("one.example/workload@sha256:"+digest),"sha256:"+digest)
+        for image in ("one.example/workload:latest","one.example/workload@sha256:"+digest.upper()):
+            with self.subTest(image=image),self.assertRaises(ValueError): bench.image_digest(image)
     def test_optional_external_buildkite_timings(self):
         with mock.patch.dict(bench.os.environ,{"SPOREVM_BUILDKITE_QUEUE_WAIT_MS":"12.5"},clear=True):
             self.assertEqual(bench.optional_ms_env("SPOREVM_BUILDKITE_QUEUE_WAIT_MS"),12.5)
@@ -71,8 +76,8 @@ class BenchmarkTest(unittest.TestCase):
         self.assertNotIn("SPOREVM_TERMINAL_JSON_BASE64",cleanup_script)
     def test_k8s_deletes_coordinator_before_reading_and_removing_results(self):
         paths=["spec/a_spec.rb"]
-        workload={"revision":REV,"sourceDirty":False,"image":"example.com/workload@sha256:"+"b"*64,"inventory":{"count":1,"sha256":bench.path_digest(paths),"paths":paths},"shardCount":1,"iterations":1,"warmups":1,"platform":"linux/arm64","cachePosture":bench.CACHE_POSTURE}
-        base={"schema":bench.SCHEMA,"schemaVersion":2,"createdAt":bench.now(),"success":False,"workload":workload}
+        workload={"revision":REV,"sourceDirty":False,"imageRef":"example.com/workload@sha256:"+"b"*64,"imageDigest":"sha256:"+"b"*64,"inventory":{"count":1,"sha256":bench.path_digest(paths),"paths":paths},"shardCount":1,"iterations":1,"warmups":1,"platform":"linux/arm64","cachePosture":bench.CACHE_POSTURE}
+        base={"schema":bench.SCHEMA,"schemaVersion":3,"createdAt":bench.now(),"success":False,"workload":workload}
         provenance={"identity":{"podUID":"uid","nodeName":"node"},"report":{"configuredRuntimeImage":"runtime","runtimeImageID":"runtime@sha256:"+"c"*64,"architecture":"arm64","executionSlots":1,"healthy":True,"sporeVMVersion":None,"versionVerification":"not exposed by public agent status"}}
         events=[]; current={"run":None}
         def fake_run(command,**_kwargs):
@@ -89,7 +94,7 @@ class BenchmarkTest(unittest.TestCase):
             if command[1]=="logs": return terminal(run=current["run"])+"\n"
             raise AssertionError(command)
         with tempfile.TemporaryDirectory() as d:
-            args=argparse.Namespace(image=workload["image"],shards=1,iterations=1,warmups=1,report=str(Path(d)/"report.json"),allow_dirty=False,runtime_image="example.com/runtime@sha256:"+"d"*64,verifier_image=None,sporectl="sporectl",kubectl="kubectl",namespace="sporevm-system",result_root="/var/lib/sporevm/results",timeout=30)
+            args=argparse.Namespace(image=workload["imageRef"],shards=1,iterations=1,warmups=1,report=str(Path(d)/"report.json"),allow_dirty=False,runtime_image="example.com/runtime@sha256:"+"d"*64,verifier_image=None,sporectl="sporectl",kubectl="kubectl",namespace="sporevm-system",result_root="/var/lib/sporevm/results",timeout=30)
             with mock.patch.object(bench,"common",return_value=copy.deepcopy(base)),mock.patch.object(bench,"agent_provenance",return_value=provenance),mock.patch.object(bench.subprocess,"run",side_effect=fake_run),mock.patch.object(bench.subprocess,"check_output",side_effect=fake_check_output):
                 bench.k8s(args)
             self.assertTrue(Path(args.report).is_file())
@@ -102,8 +107,8 @@ class BenchmarkTest(unittest.TestCase):
             self.assertNotIn("apply-cleanup",ordered)
     def test_k8s_failure_stops_coordinator_before_result_cleanup(self):
         paths=["spec/a_spec.rb"]
-        workload={"revision":REV,"sourceDirty":False,"image":"example.com/workload@sha256:"+"b"*64,"inventory":{"count":1,"sha256":bench.path_digest(paths),"paths":paths},"shardCount":1,"iterations":1,"warmups":1,"platform":"linux/arm64","cachePosture":bench.CACHE_POSTURE}
-        base={"schema":bench.SCHEMA,"schemaVersion":2,"createdAt":bench.now(),"success":False,"workload":workload}
+        workload={"revision":REV,"sourceDirty":False,"imageRef":"example.com/workload@sha256:"+"b"*64,"imageDigest":"sha256:"+"b"*64,"inventory":{"count":1,"sha256":bench.path_digest(paths),"paths":paths},"shardCount":1,"iterations":1,"warmups":1,"platform":"linux/arm64","cachePosture":bench.CACHE_POSTURE}
+        base={"schema":bench.SCHEMA,"schemaVersion":3,"createdAt":bench.now(),"success":False,"workload":workload}
         provenance={"identity":{"podUID":"uid","nodeName":"node"},"report":{"architecture":"arm64"}}
         events=[]
         def fake_run(command,**_kwargs):
@@ -112,7 +117,7 @@ class BenchmarkTest(unittest.TestCase):
             if command[1:3]==["apply","-f"]: events.append("apply-cleanup")
             return bench.subprocess.CompletedProcess(command,0)
         with tempfile.TemporaryDirectory() as d:
-            args=argparse.Namespace(image=workload["image"],shards=1,iterations=1,warmups=1,report=str(Path(d)/"report.json"),allow_dirty=False,runtime_image="example.com/runtime@sha256:"+"d"*64,verifier_image=None,sporectl="sporectl",kubectl="kubectl",namespace="sporevm-system",result_root="/var/lib/sporevm/results",timeout=30)
+            args=argparse.Namespace(image=workload["imageRef"],shards=1,iterations=1,warmups=1,report=str(Path(d)/"report.json"),allow_dirty=False,runtime_image="example.com/runtime@sha256:"+"d"*64,verifier_image=None,sporectl="sporectl",kubectl="kubectl",namespace="sporevm-system",result_root="/var/lib/sporevm/results",timeout=30)
             with mock.patch.object(bench,"common",return_value=copy.deepcopy(base)),mock.patch.object(bench,"agent_provenance",return_value=provenance),mock.patch.object(bench.subprocess,"run",side_effect=fake_run):
                 with self.assertRaisesRegex(RuntimeError,"sporectl submit"):
                     bench.k8s(args)
@@ -121,7 +126,7 @@ class BenchmarkTest(unittest.TestCase):
         self.assertLess(events.index("delete-job"),events.index("apply-cleanup"))
     def reports(self):
         paths=["spec/a_spec.rb"]
-        workload={"revision":"a"*40,"sourceDirty":False,"image":"example.com/workload@sha256:"+"b"*64,"inventory":{"count":1,"sha256":bench.path_digest(paths),"paths":paths},"shardCount":2,"iterations":3,"warmups":1,"platform":"linux/arm64","cachePosture":bench.CACHE_POSTURE}
+        workload={"revision":"a"*40,"sourceDirty":False,"imageRef":"buildkite.example/workload@sha256:"+"b"*64,"imageDigest":"sha256:"+"b"*64,"inventory":{"count":1,"sha256":bench.path_digest(paths),"paths":paths},"shardCount":2,"iterations":3,"warmups":1,"platform":"linux/arm64","cachePosture":bench.CACHE_POSTURE}
         a_samples=[10,30,20]; b_samples=[5,15,10]
         def shards(run_id=None,docker=False):
             rows=[]
@@ -133,24 +138,30 @@ class BenchmarkTest(unittest.TestCase):
                 rows.append(row)
             return rows
         a_fanouts=[{"phase":"warmup" if index==0 else "measured","fanoutWallMs":wall,"shards":shards(docker=True)} for index,wall in enumerate([11,*a_samples])]
-        a={"schema":bench.SCHEMA,"schemaVersion":2,"kind":"buildkite-docker","success":True,"workload":workload,"system":{"platform":"linux/arm64","architecture":"arm64"},"fanouts":a_fanouts,"timing":{"fanoutWallSamplesMs":a_samples,"fanoutWallPercentilesMs":bench.percentiles(a_samples),"excludedWarmupFanoutWallSamplesMs":[11]}}
+        a={"schema":bench.SCHEMA,"schemaVersion":3,"kind":"buildkite-docker","success":True,"workload":workload,"system":{"platform":"linux/arm64","architecture":"arm64"},"fanouts":a_fanouts,"timing":{"fanoutWallSamplesMs":a_samples,"fanoutWallPercentilesMs":bench.percentiles(a_samples),"excludedWarmupFanoutWallSamplesMs":[11]}}
         records=[]
         for index,wall in enumerate([6,*b_samples]):
             run_id=f"rails-bench-{index:032x}"
             records.append({"runID":run_id,"phase":"warmup" if index==0 else "measured","fanoutWallMs":wall,"prepareWallMs":2,"coordinatorRunWallMs":wall-2,"submissionWallMs":4+index,"prepare":{"childCount":2,"timingsMs":{"runSave":1,"fork":1}},"shards":shards(run_id=run_id)})
         runtime_digest="example.com/runtime@sha256:"+"c"*64
-        b={"schema":bench.SCHEMA,"schemaVersion":2,"kind":"kubernetes-sporevm","success":True,"workload":copy.deepcopy(workload),"coordinatorRuntimeImage":runtime_digest,"agentProvenance":{"architecture":"arm64","runtimeImageID":runtime_digest,"executionSlots":2,"healthy":True},"cleanup":{"success":True},"iterations":records,"timing":{"fanoutWallSamplesMs":b_samples,"fanoutWallPercentilesMs":bench.percentiles(b_samples),"excludedWarmupFanoutWallSamplesMs":[6],"submissionWallSamplesMs":[5,6,7]}}
+        b_workload=copy.deepcopy(workload); b_workload["imageRef"]="spore-registry.sporevm-system.svc.cluster.local:5000/workload@sha256:"+"b"*64
+        b={"schema":bench.SCHEMA,"schemaVersion":3,"kind":"kubernetes-sporevm","success":True,"workload":b_workload,"coordinatorRuntimeImage":runtime_digest,"agentProvenance":{"architecture":"arm64","runtimeImageID":runtime_digest,"executionSlots":2,"healthy":True},"cleanup":{"success":True},"iterations":records,"timing":{"fanoutWallSamplesMs":b_samples,"fanoutWallPercentilesMs":bench.percentiles(b_samples),"excludedWarmupFanoutWallSamplesMs":[6],"submissionWallSamplesMs":[5,6,7]}}
         return a,b
     def test_comparison_raw_and_median(self):
         got=bench.comparison(*self.reports()); self.assertEqual(got["kubernetesToBuildkiteRatio"],.5); self.assertEqual(got["buildkite"]["medianMs"],20)
+        self.assertEqual(got["images"],{"digest":"sha256:"+"b"*64,"buildkiteRef":"buildkite.example/workload@sha256:"+"b"*64,"kubernetesRef":"spore-registry.sporevm-system.svc.cluster.local:5000/workload@sha256:"+"b"*64})
+        self.assertNotIn("imageRef",got["workload"])
     def test_every_compatibility_field(self):
-        for key in ("revision","sourceDirty","image","inventory","shardCount","iterations","warmups","platform","cachePosture"):
+        for key in ("revision","sourceDirty","inventory","shardCount","iterations","warmups","platform","cachePosture"):
             a,b=self.reports(); b["workload"][key]="different"
             with self.subTest(key=key),self.assertRaises(ValueError): bench.comparison(a,b)
+        a,b=self.reports(); b["workload"].update(imageRef="k8s.example/workload@sha256:"+"c"*64,imageDigest="sha256:"+"c"*64)
+        with self.assertRaisesRegex(ValueError,"imageDigest"): bench.comparison(a,b)
     def test_comparison_rejects_equally_malformed_provenance(self):
         for mutate in (
             lambda a,b: (a["workload"].pop("revision"),b["workload"].pop("revision")),
             lambda a,b: (a["workload"].update(sourceDirty=True),b["workload"].update(sourceDirty=True)),
+            lambda a,b: (a["workload"].update(imageDigest="sha256:"+"c"*64),b["workload"].update(imageDigest="sha256:"+"c"*64)),
             lambda a,b: (a["workload"]["inventory"].update(sha256="0"*64),b["workload"]["inventory"].update(sha256="0"*64)),
             lambda a,b: (a["timing"].update(fanoutWallSamplesMs=[1]),b["timing"].update(fanoutWallSamplesMs=[1])),
         ):
