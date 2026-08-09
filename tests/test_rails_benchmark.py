@@ -13,7 +13,7 @@ def marker(index=0,count=1,paths=("spec/a_spec.rb",),revision=REV):
             f"SPOREVM_RSPEC_SHARD parallel_index={index} parallel_count={count} selected={len(paths)} selected_sha256={digest} source_revision={revision} identity_source=x\n"
             f"SPOREVM_RSPEC_DONE parallel_index={index} parallel_count={count} exit=0 duration_ms=12 source_revision={revision}\n")
 def terminal(child=0,run="run",text=None,**output):
-    raw=(text or marker()).encode(); out={"stdoutBytes":len(raw),"stdoutPreviewBase64":base64.b64encode(raw).decode(),"stderrBytes":0,"stderrPreviewBase64":"",**output}
+    raw=(text or "SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=4\n"+marker()).encode(); out={"stdoutBytes":len(raw),"stdoutPreviewBase64":base64.b64encode(raw).decode(),"stderrBytes":0,"stderrPreviewBase64":"",**output}
     obj={"runID":run,"childID":child,"attemptID":f"{run}-child-{child}-attempt-01","status":"succeeded","terminal":True,"output":out}
     return "SPOREVM_TERMINAL_JSON_BASE64 "+base64.b64encode(json.dumps(obj).encode()).decode()
 def runtime(run="run",n=2):
@@ -23,8 +23,12 @@ def runtime(run="run",n=2):
 class BenchmarkTest(unittest.TestCase):
     def test_marker_strictness_and_assignment(self):
         got=bench.parse_markers(marker(),0,1,REV); bench.validate_assignment(got,["spec/a_spec.rb"],0,1,REV)
+        resumed=bench.parse_markers("SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=4\n"+marker(),0,1,REV,require_resume=True)
+        self.assertEqual(resumed["postgresResumeMs"],4)
         for bad in [marker()+marker(),marker().replace("duration_ms=12","duration_ms=-1"),marker().replace("parallel_index=0","parallel_index=1",1),marker().replace("source_revision="+REV,"source_revision=x"),marker().replace("selected=1","selected")]:
             with self.subTest(bad=bad[-80:]),self.assertRaises(ValueError): bench.parse_markers(bad,0,1,REV)
+        for bad in [marker(),"SPOREVM_POSTGRES_RESUME action=reused status=ready duration_ms=4\n"+marker(),"SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=-1\n"+marker()]:
+            with self.subTest(resume=bad[:80]),self.assertRaises(ValueError): bench.parse_markers(bad,0,1,REV,require_resume=True)
     def test_empty_inventory_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaisesRegex(ValueError,"empty"): bench.inventory(Path(d))
@@ -134,7 +138,7 @@ class BenchmarkTest(unittest.TestCase):
                 selected=bench.shard_paths(paths,index,2)
                 row={"index":index,"selectedCount":len(selected),"selectedSha256":bench.path_digest(selected),"executionMs":1,"sourceRevision":workload["revision"],"setupMs":{"initdb_ms":1,"postgres_ms":2,"schema_ms":3,"before_preload_ms":7}}
                 if docker: row.update(processWallMs=2,exitCode=0)
-                else: row.update(childID=index,attemptID=f"{run_id}-child-{index}-attempt-01")
+                else: row.update(childID=index,attemptID=f"{run_id}-child-{index}-attempt-01",postgresResumeMs=4)
                 rows.append(row)
             return rows
         a_fanouts=[{"phase":"warmup" if index==0 else "measured","fanoutWallMs":wall,"shards":shards(docker=True)} for index,wall in enumerate([11,*a_samples])]
@@ -172,6 +176,7 @@ class BenchmarkTest(unittest.TestCase):
             lambda a,b: a["fanouts"][0]["shards"].pop(),
             lambda a,b: a["fanouts"][0]["shards"][0].pop("setupMs"),
             lambda a,b: b["iterations"][1].update(fanoutWallMs=99),
+            lambda a,b: b["iterations"][0]["shards"][0].pop("postgresResumeMs"),
             lambda a,b: b["iterations"][0]["shards"][0].update(attemptID="wrong"),
             lambda a,b: b["iterations"][0]["shards"][1].update(index=True,childID=True),
             lambda a,b: b.update(coordinatorRuntimeImage="example.com/runtime:latest"),

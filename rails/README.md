@@ -7,14 +7,18 @@ This example is the warm CI shape SporeVM is aiming at:
 2. Import the buildx OCI layout into SporeVM's local rootfs cache.
 3. Run that image as a SporeVM immutable rootfs.
 4. Start PostgreSQL inside the VM, load the schema, eager-load Rails and RSpec,
-   then capture the warm VM.
+   cleanly stop PostgreSQL, then capture the warm filesystem seed.
 5. Fork the captured spore into child spores.
-6. Resume the children in parallel and run one RSpec shard per child.
+6. Resume the children in parallel, start PostgreSQL from each child's private
+   seed, and run one RSpec shard per child.
 
 The rootfs is read-only on resume, so the guest coordinator copies the Rails app
 to `/tmp`, initializes PostgreSQL under `/tmp/sporevm-postgres`, and keeps all
-runtime state in guest RAM. That is the useful part: Rails boot, bundle load,
-schema load, and PostgreSQL startup happen once before capture.
+runtime state in guest RAM. PostgreSQL initialization and schema load happen
+once before capture, and the parent validates that Rails and RSpec eager-load.
+Each child starts its own postmaster from the cleanly stopped, schema-loaded seed
+and executes a fresh Ruby/Rails shard process because child commands do not
+inherit the coordinator's processes.
 
 ## Prerequisites
 
@@ -118,12 +122,14 @@ spore fanout rails-rspec.children
 Expected output includes the warm marker from the parent:
 
 ```text
+SPOREVM_POSTGRES_SEED state=stopped duration_ms=...
 SPOREVM_RAILS_READY pid=... capture_delay=2
 ```
 
 and one successful RSpec completion marker per child:
 
 ```text
+[000000] SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=...
 [000000] SPOREVM_RSPEC_DONE parallel_index=0 parallel_count=4 exit=0
 [000001] SPOREVM_RSPEC_DONE parallel_index=1 parallel_count=4 exit=0
 ```
