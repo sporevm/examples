@@ -6,9 +6,108 @@ require "digest"
 
 IDENTITY_ENV = "/run/sporevm/env"
 IDENTITY_JSON = "/run/sporevm/generation.json"
+CHILD_CONTEXT = "/tmp/sporevm-rails/child-context.json"
+CHILD_CONTEXT_SCHEMA = "sporevm-rails-child-context.v1"
+CHILD_CONTEXT_ENV = %w[
+  HOME
+  LANG
+  PATH
+  GEM_HOME
+  BUNDLE_GEMFILE
+  BUNDLE_PATH
+  BUNDLE_WITHOUT
+  RAILS_ENV
+  RACK_ENV
+  SPOREVM_SOURCE_REVISION
+  SPOREVM_RAILS_RUNTIME_ROOT
+  SPOREVM_RAILS_INITDB_MS
+  SPOREVM_RAILS_POSTGRES_MS
+  SPOREVM_RAILS_SCHEMA_MS
+  SPOREVM_RAILS_BEFORE_PRELOAD_MS
+].freeze
+CHILD_CONTEXT_FIXED_ENV = {
+  "HOME" => "/tmp/sporevm-home",
+  "LANG" => "C.UTF-8",
+  "PATH" => "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "GEM_HOME" => "/usr/local/bundle",
+  "BUNDLE_GEMFILE" => "/tmp/sporevm-rails/app/Gemfile",
+  "BUNDLE_PATH" => "/usr/local/bundle",
+  "BUNDLE_WITHOUT" => "development",
+  "RAILS_ENV" => "test",
+  "RACK_ENV" => "test",
+  "SPOREVM_RAILS_RUNTIME_ROOT" => "/tmp/sporevm-rails"
+}.freeze
+CHILD_CONTEXT_CWD = "/tmp/sporevm-rails/app"
+CHILD_CONTEXT_REEXEC_ARG = "--sporevm-child-context-loaded"
+CHILD_RUBY = "/usr/local/bin/ruby"
+
+def child_context_payload(cwd: Dir.pwd, env: ENV)
+  {
+    "schema" => CHILD_CONTEXT_SCHEMA,
+    "environment" => CHILD_CONTEXT_ENV.to_h { |key| [key, env.fetch(key)] },
+    "cwd" => cwd
+  }
+end
+
+def validate_child_context(context, expected_cwd: CHILD_CONTEXT_CWD)
+  expected_keys = %w[cwd environment schema]
+  abort "invalid Rails child context fields" unless context.is_a?(Hash) && context.keys.sort == expected_keys
+  abort "invalid Rails child context schema" unless context["schema"] == CHILD_CONTEXT_SCHEMA
+  abort "invalid Rails child context cwd" unless context["cwd"] == expected_cwd
+
+  environment = context["environment"]
+  unless environment.is_a?(Hash) && environment.keys.sort == CHILD_CONTEXT_ENV.sort && environment.values.all? { |value| value.is_a?(String) }
+    abort "invalid Rails child context environment"
+  end
+  CHILD_CONTEXT_FIXED_ENV.each do |key, value|
+    abort "invalid Rails child context #{key}" unless environment[key] == value
+  end
+  unless environment.fetch("SPOREVM_SOURCE_REVISION").match?(/\A[0-9a-f]{40}\z/)
+    abort "invalid Rails child context source revision"
+  end
+  %w[
+    SPOREVM_RAILS_INITDB_MS
+    SPOREVM_RAILS_POSTGRES_MS
+    SPOREVM_RAILS_SCHEMA_MS
+    SPOREVM_RAILS_BEFORE_PRELOAD_MS
+  ].each do |key|
+    abort "invalid Rails child context #{key}" unless environment.fetch(key).match?(/\A\d+\z/)
+  end
+
+  environment
+rescue KeyError
+  abort "invalid Rails child context environment"
+end
+
+def persist_child_context(path, expected_cwd: CHILD_CONTEXT_CWD)
+  context = child_context_payload
+  validate_child_context(context, expected_cwd: expected_cwd)
+  temporary = "#{path}.tmp-#{Process.pid}"
+  File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+    file.write(JSON.generate(context))
+    file.write("\n")
+    file.flush
+    file.fsync
+  end
+  File.rename(temporary, path)
+rescue KeyError, SystemCallError => e
+  abort "could not persist Rails child context: #{e.message}"
+ensure
+  File.unlink(temporary) if temporary && File.exist?(temporary)
+end
+
+def load_child_context(path, expected_cwd: CHILD_CONTEXT_CWD)
+  context = JSON.parse(File.read(path))
+  environment = validate_child_context(context, expected_cwd: expected_cwd)
+  environment.each { |key, value| ENV[key] = value }
+  Dir.chdir(context["cwd"])
+rescue JSON::ParserError, SystemCallError
+  abort "could not load Rails child context"
+end
 
 def parse_args(argv)
   capture_delay = nil
+  child_context_loaded = false
 
   until argv.empty?
     arg = argv.shift
@@ -19,6 +118,10 @@ def parse_args(argv)
 
       capture_delay = Integer(raw, 10)
       abort "--capture-delay must be greater than zero" unless capture_delay.positive?
+    when CHILD_CONTEXT_REEXEC_ARG
+      abort "duplicate #{CHILD_CONTEXT_REEXEC_ARG}" if child_context_loaded
+
+      child_context_loaded = true
     when "-h", "--help"
       puts "usage: sporevm-rspec-shard [--capture-delay SECONDS]"
       exit 0
@@ -27,7 +130,8 @@ def parse_args(argv)
     end
   end
 
-  capture_delay
+  abort "invalid Rails child context invocation" if capture_delay && child_context_loaded
+  [capture_delay, child_context_loaded]
 rescue ArgumentError
   abort "--capture-delay must be a positive integer"
 end
@@ -145,36 +249,52 @@ def run_specs(selected)
   RSpec::Core::Runner.run(selected, $stderr, $stdout)
 end
 
-capture_delay = parse_args(ARGV)
-preload_for_capture(capture_delay) if capture_delay
+def main
+  capture_delay, child_context_loaded = parse_args(ARGV)
+  if capture_delay
+    ENV["PATH"] = CHILD_CONTEXT_FIXED_ENV.fetch("PATH")
+    persist_child_context(CHILD_CONTEXT)
+  elsif File.file?(CHILD_CONTEXT)
+    load_child_context(CHILD_CONTEXT)
+    unless child_context_loaded
+      exec(CHILD_RUBY, File.realpath(__FILE__), CHILD_CONTEXT_REEXEC_ARG)
+    end
+    require "bundler/setup"
+  elsif child_context_loaded || File.file?(IDENTITY_ENV) || File.file?(IDENTITY_JSON)
+    abort "missing captured Rails child context in #{CHILD_CONTEXT}"
+  end
+  preload_for_capture(capture_delay) if capture_delay
 
-identity = read_identity
-parallel_index = identity.fetch("parallel_index")
-parallel_count = identity.fetch("parallel_count")
-source_revision = ENV.fetch("SPOREVM_SOURCE_REVISION", "")
-abort "missing SPOREVM_SOURCE_REVISION" unless source_revision.match?(/\A[0-9a-f]{40}\z/)
+  identity = read_identity
+  parallel_index = identity.fetch("parallel_index")
+  parallel_count = identity.fetch("parallel_count")
+  source_revision = ENV.fetch("SPOREVM_SOURCE_REVISION", "")
+  abort "missing SPOREVM_SOURCE_REVISION" unless source_revision.match?(/\A[0-9a-f]{40}\z/)
 
-if parallel_count < 1
-  abort "invalid SPORE_PARALLEL_JOB_COUNT=#{parallel_count}"
+  if parallel_count < 1
+    abort "invalid SPORE_PARALLEL_JOB_COUNT=#{parallel_count}"
+  end
+  if parallel_index.negative? || parallel_index >= parallel_count
+    abort "invalid SPORE_PARALLEL_JOB=#{parallel_index} for count #{parallel_count}"
+  end
+
+  specs = Dir["spec/**/*_spec.rb"].sort
+  selected = specs.each_with_index.select { |_path, i| (i % parallel_count) == parallel_index }.map(&:first)
+  selected_digest = Digest::SHA256.hexdigest(selected.map { |path| "#{path}\n" }.join)
+
+  puts "SPOREVM_RAILS_WARM_TIMING initdb_ms=#{ENV.fetch("SPOREVM_RAILS_INITDB_MS")} postgres_ms=#{ENV.fetch("SPOREVM_RAILS_POSTGRES_MS")} schema_ms=#{ENV.fetch("SPOREVM_RAILS_SCHEMA_MS")} before_preload_ms=#{ENV.fetch("SPOREVM_RAILS_BEFORE_PRELOAD_MS")}"
+
+  puts "SPOREVM_RSPEC_SHARD parallel_index=#{parallel_index} parallel_count=#{parallel_count} selected=#{selected.length} selected_sha256=#{selected_digest} source_revision=#{source_revision} identity_source=#{identity.fetch("source")}"
+  execution_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  if selected.empty?
+    puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=0 duration_ms=0 source_revision=#{source_revision}"
+    exit 0
+  end
+
+  status = run_specs(selected)
+  duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - execution_start) * 1000).round
+  puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=#{status} duration_ms=#{duration_ms} source_revision=#{source_revision}"
+  exit status
 end
-if parallel_index.negative? || parallel_index >= parallel_count
-  abort "invalid SPORE_PARALLEL_JOB=#{parallel_index} for count #{parallel_count}"
-end
 
-specs = Dir["spec/**/*_spec.rb"].sort
-selected = specs.each_with_index.select { |_path, i| (i % parallel_count) == parallel_index }.map(&:first)
-selected_digest = Digest::SHA256.hexdigest(selected.map { |path| "#{path}\n" }.join)
-
-puts "SPOREVM_RAILS_WARM_TIMING initdb_ms=#{ENV.fetch("SPOREVM_RAILS_INITDB_MS")} postgres_ms=#{ENV.fetch("SPOREVM_RAILS_POSTGRES_MS")} schema_ms=#{ENV.fetch("SPOREVM_RAILS_SCHEMA_MS")} before_preload_ms=#{ENV.fetch("SPOREVM_RAILS_BEFORE_PRELOAD_MS")}"
-
-puts "SPOREVM_RSPEC_SHARD parallel_index=#{parallel_index} parallel_count=#{parallel_count} selected=#{selected.length} selected_sha256=#{selected_digest} source_revision=#{source_revision} identity_source=#{identity.fetch("source")}"
-execution_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-if selected.empty?
-  puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=0 duration_ms=0 source_revision=#{source_revision}"
-  exit 0
-end
-
-status = run_specs(selected)
-duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - execution_start) * 1000).round
-puts "SPOREVM_RSPEC_DONE parallel_index=#{parallel_index} parallel_count=#{parallel_count} exit=#{status} duration_ms=#{duration_ms} source_revision=#{source_revision}"
-exit status
+main if __FILE__ == $PROGRAM_NAME
