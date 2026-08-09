@@ -12,7 +12,6 @@ steps:
       test "$${revision}" = "$${BUILDKITE_COMMIT}"
       registry_name="sporevm-examples-registry-$${BUILDKITE_JOB_ID%%-*}"
       builder_name="sporevm-examples-$${BUILDKITE_JOB_ID%%-*}"
-      image_tag="localhost:5000/sporevm/examples-rails-rspec:sha-$${revision}"
       archive="rails-rspec-linux-arm64.oci"
 
       cleanup() {
@@ -22,14 +21,23 @@ steps:
       trap cleanup EXIT
       cleanup
 
-      docker run -d --name "$${registry_name}" --network host \
-        -e REGISTRY_HTTP_ADDR=127.0.0.1:5000 \
+      docker run -d --name "$${registry_name}" \
+        --publish 127.0.0.1::5000 \
         docker.io/library/registry:2 >/dev/null
-      python3 - <<'PY'
-      import time, urllib.request
+      registry_port="$$(docker inspect \
+        --format '{{(index (index .NetworkSettings.Ports "5000/tcp") 0).HostPort}}' \
+        "$${registry_name}")"
+      [[ "$${registry_port}" =~ ^[0-9]+$$ ]] || {
+        echo "could not resolve worker-local registry port" >&2
+        exit 1
+      }
+      image_tag="localhost:$${registry_port}/sporevm/examples-rails-rspec:sha-$${revision}"
+      python3 - "$${registry_port}" <<'PY'
+      import sys, time, urllib.request
+      port = sys.argv[1]
       for attempt in range(30):
           try:
-              with urllib.request.urlopen("http://127.0.0.1:5000/v2/", timeout=1) as response:
+              with urllib.request.urlopen(f"http://127.0.0.1:{port}/v2/", timeout=1) as response:
                   if response.status == 200:
                       break
           except Exception:
