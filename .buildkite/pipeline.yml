@@ -67,6 +67,12 @@ steps:
         -t "$${image_tag}" \
         "$${publish_context}"
       test "$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$${image_tag}")" = "linux/arm64"
+      docker run --rm \
+        --entrypoint /usr/local/bin/ruby \
+        --env SPOREVM_RSPEC_SHARD_PATH=/usr/local/bin/sporevm-rspec-shard \
+        --volume "$${PWD}/tests/test_sporevm_rspec_shard.rb:/tmp/test_sporevm_rspec_shard.rb:ro" \
+        "$${image_tag}" \
+        /tmp/test_sporevm_rspec_shard.rb
       docker push "$${image_tag}" >/dev/null
 
       digest="$$(docker run --rm --network host \
