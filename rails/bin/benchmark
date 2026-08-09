@@ -4,8 +4,8 @@ import argparse, base64, datetime as dt, hashlib, json, math, os, platform, re
 import subprocess, sys, tempfile, threading, time, uuid
 from pathlib import Path
 
-SCHEMA = "sporevm-examples.rails-rspec-benchmark.v2"
-COMPARISON_SCHEMA = "sporevm-examples.rails-rspec-benchmark-comparison.v2"
+SCHEMA = "sporevm-examples.rails-rspec-benchmark.v3"
+COMPARISON_SCHEMA = "sporevm-examples.rails-rspec-benchmark-comparison.v3"
 ROOT = Path(__file__).resolve().parents[2]
 SPEC_ROOT = ROOT / "rails" / "app"
 DIGEST_REF = re.compile(r"^.+@sha256:[0-9a-fA-F]{64}$")
@@ -16,6 +16,9 @@ def now(): return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00",
 def require_digest_ref(v, label="image"):
     if not DIGEST_REF.fullmatch(v): raise ValueError(f"{label} must be pinned by @sha256:<64 hex digits>")
     return v
+def image_digest(v, label="image"):
+    require_digest_ref(v,label)
+    return "sha256:"+v.rsplit("@sha256:",1)[1].lower()
 def inventory(root=SPEC_ROOT):
     paths = sorted(p.relative_to(root).as_posix() for p in root.glob("spec/**/*_spec.rb"))
     if not paths: raise ValueError("local spec inventory is empty")
@@ -157,10 +160,10 @@ def reset_report(path):
     try: Path(path).unlink()
     except FileNotFoundError: pass
 def common(args):
-    require_digest_ref(args.image,"workload image")
+    digest=image_digest(args.image,"workload image")
     if args.shards<1 or args.iterations<1 or args.warmups!=1: raise ValueError("shards/iterations must be positive and the canonical benchmark requires exactly one warmup")
     rev,dirty=git_source(args.allow_dirty)
-    return {"schema":SCHEMA,"schemaVersion":2,"createdAt":now(),"success":False,"workload":{"revision":rev,"sourceDirty":dirty,"image":args.image,"inventory":inventory(),"shardCount":args.shards,"iterations":args.iterations,"warmups":args.warmups,"platform":"linux/arm64","cachePosture":CACHE_POSTURE}}
+    return {"schema":SCHEMA,"schemaVersion":3,"createdAt":now(),"success":False,"workload":{"revision":rev,"sourceDirty":dirty,"imageRef":args.image,"imageDigest":digest,"inventory":inventory(),"shardCount":args.shards,"iterations":args.iterations,"warmups":args.warmups,"platform":"linux/arm64","cachePosture":CACHE_POSTURE}}
 def summarize(samples): return {"fanoutWallSamplesMs":samples,"fanoutWallPercentilesMs":percentiles(samples)}
 
 def docker_inspect(args,revision):
@@ -327,12 +330,13 @@ def validate_report_shards(rows,workload,run_id=None,docker=False):
               row["childID"]!=index or row.get("attemptID")!=f"{run_id}-child-{index}-attempt-01"):
             raise ValueError("Kubernetes shard attempt identity mismatch")
 def validate_report(report,kind):
-    if report.get("schema")!=SCHEMA or report.get("schemaVersion")!=2 or report.get("kind")!=kind or report.get("success") is not True: raise ValueError(f"invalid {kind} report envelope")
+    if report.get("schema")!=SCHEMA or report.get("schemaVersion")!=3 or report.get("kind")!=kind or report.get("success") is not True: raise ValueError(f"invalid {kind} report envelope")
     workload=report.get("workload")
     if not isinstance(workload,dict): raise ValueError("workload provenance missing")
     revision=workload.get("revision")
     if not re.fullmatch(r"[0-9a-f]{40}",revision or "") or workload.get("sourceDirty") is not False: raise ValueError("workload source provenance is not clean")
-    require_digest_ref(workload.get("image", ""),"workload image")
+    digest=image_digest(workload.get("imageRef", ""),"workload image reference")
+    if workload.get("imageDigest")!=digest: raise ValueError("workload image digest does not match its reference")
     inventory_value=workload.get("inventory")
     if not isinstance(inventory_value,dict): raise ValueError("workload inventory missing")
     paths=inventory_value.get("paths")
@@ -381,11 +385,12 @@ def validate_report(report,kind):
     return workload,samples
 def comparison(a,b):
     aw,av=validate_report(a,"buildkite-docker"); bw,bv=validate_report(b,"kubernetes-sporevm")
-    keys=("revision","sourceDirty","image","inventory","shardCount","iterations","warmups","platform","cachePosture")
+    keys=("revision","sourceDirty","imageDigest","inventory","shardCount","iterations","warmups","platform","cachePosture")
     mismatch=[k for k in keys if aw[k]!=bw[k]]
     if mismatch: raise ValueError("incompatible reports: "+", ".join(mismatch))
     am,bm=nearest_rank(av,.5),nearest_rank(bv,.5)
-    return {"schema":COMPARISON_SCHEMA,"schemaVersion":2,"createdAt":now(),"success":True,"headlineMetric":"measured fanout wall median","buildkite":{"rawFanoutWallSamplesMs":av,"percentilesMs":percentiles(av),"medianMs":am},"kubernetes":{"rawFanoutWallSamplesMs":bv,"percentilesMs":percentiles(bv),"medianMs":bm},"kubernetesToBuildkiteRatio":bm/am,"buildkiteToKubernetesRatio":am/bm,"kubernetesDeltaMs":bm-am,"kubernetesFaster":bm<am,"workload":aw}
+    workload=dict(aw); buildkite_ref=workload.pop("imageRef")
+    return {"schema":COMPARISON_SCHEMA,"schemaVersion":3,"createdAt":now(),"success":True,"headlineMetric":"measured fanout wall median","buildkite":{"rawFanoutWallSamplesMs":av,"percentilesMs":percentiles(av),"medianMs":am},"kubernetes":{"rawFanoutWallSamplesMs":bv,"percentilesMs":percentiles(bv),"medianMs":bm},"kubernetesToBuildkiteRatio":bm/am,"buildkiteToKubernetesRatio":am/bm,"kubernetesDeltaMs":bm-am,"kubernetesFaster":bm<am,"images":{"digest":workload["imageDigest"],"buildkiteRef":buildkite_ref,"kubernetesRef":bw["imageRef"]},"workload":workload}
 def compare(args):
     if args.report: reset_report(args.report)
     result=comparison(json.loads(Path(args.buildkite_report).read_text()),json.loads(Path(args.k8s_report).read_text()))
