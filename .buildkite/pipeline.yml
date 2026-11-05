@@ -1,6 +1,6 @@
 steps:
-  - label: ":package: Build and benchmark Rails RSpec ARM64 image"
-    key: rails-rspec-arm64-build-and-benchmark
+  - label: ":package: Build Rails RSpec ARM64 image"
+    key: rails-rspec-arm64-build
     if: build.env("SPOREVM_RAILS_BUILD_LOCAL") == "1"
     agents:
       queue: sporevm-linux-arm64
@@ -12,62 +12,25 @@ steps:
       test "$${revision}" = "$${BUILDKITE_COMMIT}"
       test -z "$$(git status --porcelain)"
       case "$$(uname -m)" in arm64|aarch64) ;; *) echo "worker is not ARM64" >&2; exit 1 ;; esac
-      registry_name="sporevm-examples-registry-$${BUILDKITE_JOB_ID%%-*}"
-      capture_name="$${registry_name}-capture"
-      artifact_dir=""
-      archive=""
-      publish_context=""
-      image_tag=""
-      image_ref=""
+      image_tag="sporevm-examples-rails-rspec:$${BUILDKITE_JOB_ID}"
+      capture_name="sporevm-examples-capture-$${BUILDKITE_JOB_ID%%-*}"
+      build_context=""
 
       cleanup() {
-        if [[ -n "$${image_ref}" ]]; then
-          docker image rm -f "$${image_ref}" >/dev/null 2>&1 || true
-        fi
-        if [[ -n "$${image_tag}" ]]; then
-          docker image rm -f "$${image_tag}" >/dev/null 2>&1 || true
-        fi
         docker rm -f "$${capture_name}" >/dev/null 2>&1 || true
-        docker rm -f "$${registry_name}" >/dev/null 2>&1 || true
-        rm -rf "$${artifact_dir}" "$${publish_context}"
+        docker image rm -f "$${image_tag}" >/dev/null 2>&1 || true
+        rm -rf "$${build_context}"
       }
       trap cleanup EXIT
       cleanup
-      artifact_dir="$$(mktemp -d "/tmp/sporevm-rails-artifacts.XXXXXX")"
-      archive="$${artifact_dir}/rails-rspec-linux-arm64.oci"
-      publish_context="$$(mktemp -d "/tmp/sporevm-rails-publish.XXXXXX")"
+      build_context="$$(mktemp -d "/tmp/sporevm-rails-build.XXXXXX")"
 
-      docker run -d --name "$${registry_name}" \
-        --publish 127.0.0.1::5000 \
-        docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 >/dev/null
-      registry_port="$$(docker inspect \
-        --format '{{(index (index .NetworkSettings.Ports "5000/tcp") 0).HostPort}}' \
-        "$${registry_name}")"
-      [[ "$${registry_port}" =~ ^[0-9]+$$ ]] || {
-        echo "could not resolve worker-local registry port" >&2
-        exit 1
-      }
-      image_tag="localhost:$${registry_port}/sporevm/examples-rails-rspec:sha-$${revision}"
-      python3 - "$${registry_port}" <<'PY'
-      import sys, time, urllib.request
-      port = sys.argv[1]
-      for attempt in range(30):
-          try:
-              with urllib.request.urlopen(f"http://127.0.0.1:{port}/v2/", timeout=1) as response:
-                  if response.status == 200:
-                      break
-          except Exception:
-              if attempt == 29:
-                  raise
-              time.sleep(1)
-      PY
-
-      git archive --format=tar "$${revision}:rails" | tar -xf - -C "$${publish_context}"
+      git archive --format=tar "$${revision}:rails" | tar -xf - -C "$${build_context}"
       docker build \
         --build-arg "VCS_REF=$${revision}" \
         --build-arg "SOURCE_URL=https://github.com/sporevm/examples" \
         -t "$${image_tag}" \
-        "$${publish_context}"
+        "$${build_context}"
       test "$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$${image_tag}")" = "linux/arm64"
       docker run --rm \
         --entrypoint /usr/local/bin/ruby \
@@ -99,102 +62,3 @@ steps:
       ! grep -Fq 'SPOREVM_RAILS_RESUMED' <<<"$${capture_output}"
       test "$$(grep -n '^SPOREVM_POSTGRES_SEED ' <<<"$${capture_output}" | cut -d: -f1)" -lt \
         "$$(grep -n '^SPOREVM_RAILS_READY ' <<<"$${capture_output}" | cut -d: -f1)"
-      docker push "$${image_tag}" >/dev/null
-
-      digest="$$(docker run --rm --network host \
-        quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615 \
-        inspect --tls-verify=false --format '{{.Digest}}' \
-        "docker://$${image_tag}")"
-      [[ "$${digest}" =~ ^sha256:[0-9a-f]{64}$$ ]] || {
-        echo "could not resolve canonical workload digest" >&2
-        exit 1
-      }
-      image_ref="$${image_tag%:*}@$${digest}"
-      docker pull "$${image_ref}" >/dev/null
-
-      docker run --rm --network host \
-        --user "$$(id -u):$$(id -g)" \
-        --volume "$${artifact_dir}:/artifacts" \
-        quay.io/skopeo/stable@sha256:c7d3c512612f52805023cd38351081dad7e2729fc13d14b701e47c7c8bdd6615 \
-        copy --all --preserve-digests --src-tls-verify=false \
-        "docker://$${image_ref}" \
-        "oci-archive:/artifacts/rails-rspec-linux-arm64.oci"
-
-      python3 - "$${archive}" "$${digest}" "$${revision}" "$${image_tag}" "$${artifact_dir}/rails-rspec-image.json" <<'PY'
-      import hashlib, json, sys, tarfile
-      archive, expected_digest, revision, image_tag, metadata_path = sys.argv[1:]
-      def file_sha256(path):
-          digest = hashlib.sha256()
-          with open(path, "rb") as source:
-              for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                  digest.update(chunk)
-          return digest.hexdigest()
-      with tarfile.open(archive) as image:
-          index = json.load(image.extractfile("index.json"))
-          manifests = index.get("manifests", [])
-          if len(manifests) != 1 or manifests[0].get("digest") != expected_digest:
-              raise SystemExit("OCI archive manifest digest did not match registry digest")
-          algorithm, encoded = expected_digest.split(":", 1)
-          manifest_bytes = image.extractfile(f"blobs/{algorithm}/{encoded}").read()
-          if hashlib.sha256(manifest_bytes).hexdigest() != encoded:
-              raise SystemExit("OCI archive manifest content was not digest-addressed")
-          manifest = json.loads(manifest_bytes)
-          config_algorithm, config_encoded = manifest["config"]["digest"].split(":", 1)
-          config_bytes = image.extractfile(f"blobs/{config_algorithm}/{config_encoded}").read()
-          if config_algorithm != "sha256" or hashlib.sha256(config_bytes).hexdigest() != config_encoded:
-              raise SystemExit("OCI archive config content was not digest-addressed")
-          config = json.loads(config_bytes)
-          if config.get("os") != "linux" or config.get("architecture") != "arm64":
-              raise SystemExit("OCI archive was not linux/arm64")
-          labels = config.get("config", {}).get("Labels", {})
-          if labels.get("org.opencontainers.image.revision") != revision:
-              raise SystemExit("OCI archive revision label did not match checkout")
-      metadata = {
-          "schema": "sporevm-examples.rails-rspec-image.v1",
-          "sourceRevision": revision,
-          "platform": "linux/arm64",
-          "buildkiteImageRef": image_tag.rsplit(":", 1)[0] + "@" + expected_digest,
-          "imageDigest": expected_digest,
-          "archiveSha256": file_sha256(archive),
-      }
-      with open(metadata_path, "w") as output:
-          json.dump(metadata, output, indent=2, sort_keys=True)
-          output.write("\n")
-      PY
-
-      python3 rails/bin/benchmark buildkite \
-        --image "$${image_ref}" \
-        --shards "$${SPOREVM_RAILS_SHARDS:-4}" \
-        --iterations "$${SPOREVM_RAILS_ITERATIONS:-5}" \
-        --warmups 1 \
-        --report "$${artifact_dir}/rails-rspec-buildkite.json"
-
-      mv \
-        "$${archive}" \
-        "$${artifact_dir}/rails-rspec-image.json" \
-        "$${artifact_dir}/rails-rspec-buildkite.json" \
-        .
-    artifact_paths:
-      - rails-rspec-linux-arm64.oci
-      - rails-rspec-image.json
-      - rails-rspec-buildkite.json
-
-  - label: ":docker: Rails RSpec ARM64 benchmark"
-    key: rails-rspec-arm64-benchmark
-    if: build.env("SPOREVM_RAILS_IMAGE") != null
-    agents:
-      queue: sporevm-linux-arm64
-    command: |
-      set -euo pipefail
-      case "$${SPOREVM_RAILS_IMAGE:-}" in
-        *@sha256:????????????????????????????????????????????????????????????????) ;;
-        *) echo "SPOREVM_RAILS_IMAGE must be digest-pinned" >&2; exit 2 ;;
-      esac
-      python3 rails/bin/benchmark buildkite \
-        --image "$${SPOREVM_RAILS_IMAGE}" \
-        --shards "$${SPOREVM_RAILS_SHARDS:-4}" \
-        --iterations "$${SPOREVM_RAILS_ITERATIONS:-5}" \
-        --warmups 1 \
-        --report rails-rspec-buildkite.json
-    artifact_paths:
-      - rails-rspec-buildkite.json
