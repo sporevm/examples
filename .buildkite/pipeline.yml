@@ -8,29 +8,18 @@ steps:
     command: |
       set -euo pipefail
 
-      revision="$$(git rev-parse HEAD)"
-      test "$${revision}" = "$${BUILDKITE_COMMIT}"
-      test -z "$$(git status --porcelain)"
       case "$$(uname -m)" in arm64|aarch64) ;; *) echo "worker is not ARM64" >&2; exit 1 ;; esac
       image_tag="sporevm-examples-rails-rspec:$${BUILDKITE_JOB_ID}"
       capture_name="sporevm-examples-capture-$${BUILDKITE_JOB_ID%%-*}"
-      build_context=""
 
       cleanup() {
         docker rm -f "$${capture_name}" >/dev/null 2>&1 || true
         docker image rm -f "$${image_tag}" >/dev/null 2>&1 || true
-        rm -rf "$${build_context}"
       }
       trap cleanup EXIT
       cleanup
-      build_context="$$(mktemp -d "/tmp/sporevm-rails-build.XXXXXX")"
 
-      git archive --format=tar "$${revision}:rails" | tar -xf - -C "$${build_context}"
-      docker build \
-        --build-arg "VCS_REF=$${revision}" \
-        --build-arg "SOURCE_URL=https://github.com/sporevm/examples" \
-        -t "$${image_tag}" \
-        "$${build_context}"
+      docker build -t "$${image_tag}" rails
       test "$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$${image_tag}")" = "linux/arm64"
       docker run --rm \
         --entrypoint /usr/local/bin/ruby \

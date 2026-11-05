@@ -1,16 +1,10 @@
 FROM ruby:3.3-alpine
 
 ARG TARGETPLATFORM
-ARG VCS_REF="0000000000000000000000000000000000000000"
-ARG SOURCE_URL="https://github.com/sporevm/examples"
-
-LABEL org.opencontainers.image.source="${SOURCE_URL}" \
-      org.opencontainers.image.revision="${VCS_REF}"
 
 ENV BUNDLE_WITHOUT=development \
     BUNDLE_PATH=/usr/local/bundle \
-    RAILS_ENV=test \
-    SPOREVM_SOURCE_REVISION=${VCS_REF}
+    RAILS_ENV=test
 
 RUN apk add --no-cache \
       bash \

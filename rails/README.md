@@ -95,6 +95,9 @@ bash rails/bin/build-image \
   --image ghcr.io/YOUR_ORG/sporevm-rails-rspec:dev
 ```
 
+CI builds the image on ARM64, runs the shard tests inside it, and checks the
+capture handoff only in builds triggered with `SPOREVM_RAILS_BUILD_LOCAL=1`.
+
 ## Run the Fan-Out Demo
 
 ```bash

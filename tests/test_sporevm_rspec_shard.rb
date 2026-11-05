@@ -11,8 +11,6 @@ SHARD_PATH = ENV.fetch(
 load SHARD_PATH
 
 class SporevmRspecShardTest < Minitest::Test
-  REVISION = "f" * 40
-
   def setup
     @original_cwd = Dir.pwd
     @original_env = ENV.to_h
@@ -25,14 +23,7 @@ class SporevmRspecShardTest < Minitest::Test
 
   def populate_context_env
     CHILD_CONTEXT_FIXED_ENV.each { |key, value| ENV[key] = value }
-    ENV["SPOREVM_SOURCE_REVISION"] = REVISION
     ENV["SPOREVM_POSTGRES_BIN"] = "/usr/bin"
-    %w[
-      SPOREVM_RAILS_INITDB_MS
-      SPOREVM_RAILS_POSTGRES_MS
-      SPOREVM_RAILS_SCHEMA_MS
-      SPOREVM_RAILS_BEFORE_PRELOAD_MS
-    ].each { |key| ENV[key] = "1" }
   end
 
   def assert_rejected(message = /invalid Rails child context/)
@@ -73,10 +64,8 @@ class SporevmRspecShardTest < Minitest::Test
         ->(value) { value["schema"] = "wrong" },
         ->(value) { value["extra"] = true },
         ->(value) { value["environment"]["EXTRA"] = "value" },
-        ->(value) { value["environment"].delete("SPOREVM_SOURCE_REVISION") },
-        ->(value) { value["environment"]["SPOREVM_SOURCE_REVISION"] = "not-a-revision" },
+        ->(value) { value["environment"].delete("SPOREVM_POSTGRES_BIN") },
         ->(value) { value["environment"]["SPOREVM_POSTGRES_BIN"] = "../bin" },
-        ->(value) { value["environment"]["SPOREVM_RAILS_INITDB_MS"] = "-1" },
         ->(value) { value["environment"]["PATH"] = "/unexpected" },
         ->(value) { value["cwd"] = "/unexpected" }
       ]
@@ -249,25 +238,18 @@ class SporevmRspecShardTest < Minitest::Test
     ENV["SPOREVM_POSTGRES_BIN"] = fake_postgres_bin
     Dir.chdir(CHILD_CONTEXT_CWD)
     persist_child_context(CHILD_CONTEXT)
+    FileUtils.mkdir_p(File.dirname(IDENTITY_ENV))
+    File.write(IDENTITY_ENV, "SPORE_PARALLEL_JOB=3\nSPORE_PARALLEL_JOB_COUNT=4\n")
 
-    environment = {
-      "SPORE_PARALLEL_JOB" => "3",
-      "SPORE_PARALLEL_JOB_COUNT" => "4"
-    }
-    stdout, stderr, status = Open3.capture3(
-      environment,
-      CHILD_RUBY,
-      SHARD_PATH,
-      unsetenv_others: true
-    )
+    stdout, stderr, status = Open3.capture3({}, CHILD_RUBY, SHARD_PATH, unsetenv_others: true)
 
     assert status.success?, stderr
     assert_includes stdout, "SPOREVM_POSTGRES_RESUME action=started status=ready"
-    assert_includes stdout, "SPOREVM_RSPEC_SHARD parallel_index=3 parallel_count=4 selected=0"
-    assert_includes stdout, "source_revision=#{REVISION}"
+    assert_includes stdout, "SPOREVM_RSPEC_SHARD parallel_index=3 parallel_count=4 selected=0 identity_source=#{IDENTITY_ENV}"
     assert_includes stdout, "SPOREVM_RSPEC_DONE parallel_index=3 parallel_count=4 exit=0"
   ensure
     if SHARD_PATH == "/usr/local/bin/sporevm-rspec-shard"
+      FileUtils.rm_rf(File.dirname(IDENTITY_ENV))
       FileUtils.rm_rf(CHILD_CONTEXT_FIXED_ENV.fetch("SPOREVM_RAILS_RUNTIME_ROOT"))
       FileUtils.rm_rf(CHILD_CONTEXT_FIXED_ENV.fetch("HOME"))
       FileUtils.rm_rf(File.dirname(POSTGRES_DATA))
