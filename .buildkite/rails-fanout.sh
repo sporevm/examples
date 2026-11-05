@@ -9,7 +9,22 @@ spore_sha256="07452068394f2cbac911cffda1dd5d97692ed5b4c5d85b30d03401654ab89327"
 # image-backed saves must share a filesystem with the rootfs cache, and other
 # spore versions on this agent must not see this job's cache.
 work="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-examples-rails.XXXXXX")"
-trap 'rm -rf "${work}"' EXIT
+cleanup() {
+  local status=$?
+  # The job directory is deleted below, so show the parent and fork logs on
+  # failure. The fan-out output is already in the job log.
+  if [[ "${status}" != "0" ]]; then
+    for log in parent fork; do
+      if [[ -f "${work}/run/${log}.log" ]]; then
+        echo "+++ ${log}.log"
+        cat "${work}/run/${log}.log"
+      fi
+    done
+  fi
+  rm -rf "${work}"
+}
+trap cleanup EXIT
+unset SPOREVM_ROOTFS_CACHE_DIR SPOREVM_KERNEL_CACHE_DIR SPOREVM_BUNDLE_CACHE_DIR SPOREVM_KERNEL_IMAGE SPOREVM_RUN_INITRD
 export XDG_CACHE_HOME="${work}/cache"
 export SPOREVM_RUNTIME_DIR="${work}/runtime"
 export TMPDIR="${work}/tmp"

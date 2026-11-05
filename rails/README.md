@@ -13,7 +13,8 @@ This example boots a Rails app once and forks the running process:
    PostgreSQL, and runs its share of the RSpec examples. Nothing is loaded
    again.
 
-CI runs this on Linux ARM64 KVM for every build and fails if any child fails.
+The `.buildkite` pipeline runs this on Linux ARM64 KVM and fails if any child
+fails.
 
 ## Run It
 
@@ -49,10 +50,15 @@ prefixes every fan-out line with milliseconds since the fan-out started:
    498 [000000] SPOREVM_RSPEC_DONE parallel_index=0 parallel_count=4 examples=1 exit=0
 ```
 
-It ends with per-child `first_response_ms`, a `timings:` line for the build,
-boot, save, fork, and fan-out, and the workdir that keeps the save and logs.
-Pass `--no-image-build` to reuse an image that is already built, or `--image`
-to run a registry image built from the same Dockerfile.
+It ends with per-child `first_response_ms` and a `timings:` line for the build,
+boot, save, fork, and fan-out. `examples=` is the number of examples RSpec ran
+in that child; the script fails unless the children's counts add up to the
+number of examples the parent loaded. The save and logs stay in the workdir
+printed at the start.
+
+Pass `--no-image-build` to reuse a local image that is already built. With
+`--image` set to a registry ref built from the same Dockerfile, the script skips
+the build and `spore run` pulls the image.
 
 ## Sharding
 

@@ -1,7 +1,5 @@
 FROM ruby:3.3-alpine
 
-ARG TARGETPLATFORM
-
 ENV BUNDLE_WITHOUT=development \
     BUNDLE_PATH=/usr/local/bundle \
     RAILS_ENV=test

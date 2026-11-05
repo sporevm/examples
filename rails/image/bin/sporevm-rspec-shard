@@ -58,5 +58,6 @@ selected = examples.select.with_index { |_, i| i % count == index }
 RSpec.world.all_examples.each { |example| example.metadata[:sporevm_shard] = selected.include?(example.id) }
 RSpec.configuration.filter_run_including(sporevm_shard: true)
 status = RSpec::Core::Runner.run([], $stderr, $stdout)
-puts "SPOREVM_RSPEC_DONE parallel_index=#{index} parallel_count=#{count} examples=#{selected.size} exit=#{status}"
+# Report the examples RSpec actually ran so the host catches missed or repeated ones.
+puts "SPOREVM_RSPEC_DONE parallel_index=#{index} parallel_count=#{count} examples=#{RSpec.configuration.reporter.examples.size} exit=#{status}"
 exit status
