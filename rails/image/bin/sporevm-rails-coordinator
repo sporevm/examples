@@ -1,30 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-capture_delay=1
-
-while (($#)); do
-  case "$1" in
-    --capture-delay)
-      [[ -n "${2-}" ]] || { echo "missing --capture-delay value" >&2; exit 2; }
-      capture_delay="$2"
-      shift 2
-      ;;
-    -h|--help)
-      echo "usage: sporevm-rails-coordinator [--capture-delay SECONDS]"
-      exit 0
-      ;;
-    *)
-      echo "unknown argument: $1" >&2
-      exit 2
-      ;;
-  esac
-done
-
-case "${capture_delay}" in
-  ''|*[!0-9]*) echo "--capture-delay must be a positive integer" >&2; exit 2 ;;
-  0) echo "--capture-delay must be greater than zero" >&2; exit 2 ;;
-esac
+# Start PostgreSQL in guest RAM, load the schema, then hand over to the Ruby
+# process that loads Rails and waits to be saved and forked. PostgreSQL keeps
+# running across the save, so every child resumes with its own live server.
 
 export HOME=/tmp/sporevm-home
 export LANG=C.UTF-8
@@ -35,48 +14,25 @@ export SPOREVM_RAILS_RUNTIME_ROOT=/tmp/sporevm-rails
 export BUNDLE_GEMFILE=/tmp/sporevm-rails/app/Gemfile
 export BUNDLE_PATH=/usr/local/bundle
 
-run_as_postgres() {
-  if command -v runuser >/dev/null 2>&1; then
-    runuser -u postgres -- "$@"
-  elif command -v su-exec >/dev/null 2>&1; then
-    su-exec postgres "$@"
-  else
-    su postgres -s /bin/sh -c "$(printf '%q ' "$@")"
-  fi
-}
+pg_data=/tmp/sporevm-postgres/data
+pg_run=/tmp/sporevm-postgres/run
+pg_log=/tmp/sporevm-postgres/log
 
-if command -v initdb >/dev/null 2>&1; then
-  pg_bin="$(dirname "$(command -v initdb)")"
-else
-  pg_bin="$(find /usr/lib/postgresql -path '*/bin/initdb' -type f | sort | tail -n 1)"
-  pg_bin="$(dirname "${pg_bin}")"
-fi
-for postgres_tool in createdb initdb pg_controldata pg_ctl pg_isready postgres psql; do
-  if [[ -z "${pg_bin}" || ! -x "${pg_bin}/${postgres_tool}" ]]; then
-    echo "postgres tool not found: ${postgres_tool}" >&2
-    exit 1
-  fi
-done
-export SPOREVM_POSTGRES_BIN="${pg_bin}"
-export PATH="${pg_bin}:${PATH}"
-
-mkdir -p "${HOME}" "${SPOREVM_RAILS_RUNTIME_ROOT}" /tmp/sporevm-postgres/data /tmp/sporevm-postgres/run /tmp/sporevm-postgres/log
+mkdir -p "${HOME}" "${SPOREVM_RAILS_RUNTIME_ROOT}" "${pg_data}" "${pg_run}" "${pg_log}"
 cp -a /opt/sporevm-rails-src "${SPOREVM_RAILS_RUNTIME_ROOT}/app"
 chown -R postgres:postgres /tmp/sporevm-postgres
 
-run_as_postgres "${pg_bin}/initdb" -D /tmp/sporevm-postgres/data --auth=trust --no-locale >/tmp/sporevm-postgres/log/initdb.log
-cat >>/tmp/sporevm-postgres/data/postgresql.conf <<'EOF'
+su-exec postgres initdb -D "${pg_data}" --auth=trust --no-locale >"${pg_log}/initdb.log"
+cat >>"${pg_data}/postgresql.conf" <<EOF
 listen_addresses = ''
-unix_socket_directories = '/tmp/sporevm-postgres/run'
+unix_socket_directories = '${pg_run}'
 fsync = off
 full_page_writes = off
 synchronous_commit = off
 EOF
-chown postgres:postgres /tmp/sporevm-postgres/data/postgresql.conf
-run_as_postgres "${pg_bin}/pg_ctl" -D /tmp/sporevm-postgres/data -l /tmp/sporevm-postgres/log/postgres.log -w start
-trap 'run_as_postgres "${pg_bin}/pg_ctl" -D /tmp/sporevm-postgres/data -m fast stop >/dev/null 2>&1 || true' EXIT
-run_as_postgres "${pg_bin}/createdb" -h /tmp/sporevm-postgres/run sporevm_rails_test
+su-exec postgres pg_ctl -D "${pg_data}" -l "${pg_log}/postgres.log" -w start
+su-exec postgres createdb -h "${pg_run}" sporevm_rails_test
 
 cd "${SPOREVM_RAILS_RUNTIME_ROOT}/app"
-bundle exec ruby bin/rails db:schema:load >/tmp/sporevm-rails/schema-load.log
-bundle exec ruby /usr/local/bin/sporevm-rspec-shard --capture-delay "${capture_delay}"
+bundle exec ruby bin/rails db:schema:load >"${SPOREVM_RAILS_RUNTIME_ROOT}/schema-load.log"
+exec bundle exec ruby /usr/local/bin/sporevm-rspec-shard

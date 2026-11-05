@@ -1,192 +1,69 @@
 # Rails/Postgres RSpec Fan-Out
 
-This example is the warm CI shape SporeVM is aiming at:
+This example boots a Rails app once and forks the running process:
 
-1. Build a Docker image that contains Ruby, Rails, PostgreSQL, the app, and the
-   test suite.
-2. Import the buildx OCI layout into SporeVM's local rootfs cache.
-3. Run that image as a SporeVM immutable rootfs.
-4. Start PostgreSQL inside the VM, load the schema, eager-load Rails and RSpec,
-   cleanly stop PostgreSQL, then capture the warm filesystem seed.
-5. Fork the captured spore into child spores.
-6. Resume the children in parallel, start PostgreSQL from each child's private
-   seed, and run one RSpec shard per child.
+1. `spore build` builds the image from [`Dockerfile`](Dockerfile): Ruby,
+   Rails, PostgreSQL, the app, and its specs.
+2. `spore run` boots it. The guest starts PostgreSQL in RAM, loads the schema,
+   then one Ruby process loads Rails and every spec file and serves a warm
+   `GET /health`.
+3. The host saves the running VM and forks N children from the save.
+4. `spore fanout` resumes every child inside that same Ruby process. Each child
+   reads its fork identity, serves `GET /health` against its own live
+   PostgreSQL, and runs its share of the RSpec examples. Nothing is loaded
+   again.
 
-The rootfs is read-only on resume, so the guest coordinator copies the Rails app
-to `/tmp`, initializes PostgreSQL under `/tmp/sporevm-postgres`, and keeps all
-runtime state in guest RAM. PostgreSQL initialization and schema load happen
-once before capture, and the parent validates that Rails and RSpec eager-load.
-Each child starts its own postmaster from the cleanly stopped, schema-loaded seed
-and executes a fresh Ruby/Rails shard process because child commands do not
-inherit the coordinator's process context. The captured coordinator remains
-parked after publishing readiness so its shell cleanup cannot race the fresh
-child command or stop the child's private postmaster.
+CI runs this on Linux ARM64 KVM for every build and fails if any child fails.
 
-## Prerequisites
+## Run It
 
-Run commands from the root of this repository. The scripts need:
-
-- Docker with buildx.
-- The `spore` binary installed on `PATH`. If needed:
-  `mise use -g github:sporevm/sporevm@latest`.
-
-## Kernel Requirements
-
-The full Postgres fan-out path works with SporeVM's managed run kernel in
-`v0.5.0` and later. That kernel includes the normal Linux facilities
-Rails/PostgreSQL needs:
-
-```text
-CONFIG_SYSVIPC=y
-CONFIG_POSIX_MQUEUE=y
-CONFIG_CGROUPS=y
-CONFIG_NAMESPACES=y
-CONFIG_SECCOMP=y
-CONFIG_MULTIUSER=y
-CONFIG_POSIX_TIMERS=y
-CONFIG_BINFMT_SCRIPT=y
-CONFIG_BLK_DEV_INITRD=y
-CONFIG_VIRTIO_BLK=y
-CONFIG_NETFILTER=y
-CONFIG_BRIDGE=y
-CONFIG_VETH=y
-CONFIG_TUN=y
-# CONFIG_DEVMEM is not set
-CONFIG_EXT4_FS=y
-CONFIG_OVERLAY_FS=y
-CONFIG_KEYS=y
-```
-
-Use `--kernel` or `SPOREVM_KERNEL_IMAGE` only when testing an unreleased kernel.
-
-## Build the OCI Image
-
-The default path does not push to a registry and does not require SporeVM to
-talk to the Docker daemon. Docker buildx writes an OCI layout tar, then
-`spore rootfs import-oci` imports that layout into the local rootfs cache:
-
-```bash
-bash rails/bin/build-image
-```
-
-The script runs the equivalent of:
-
-```bash
-docker buildx build \
-  --platform linux/arm64 \
-  --output type=oci,dest=/tmp/sporevm-rails-rspec.oci \
-  rails
-
-spore rootfs import-oci /tmp/sporevm-rails-rspec.oci \
-  --ref local/sporevm-rails-rspec:dev \
-  --platform linux/arm64
-```
-
-`local/sporevm-rails-rspec:dev` is a host-local convenience ref. Import resolves
-it to a digest-pinned `local/sporevm-rails-rspec@sha256:<manifest>` identity in
-the rootfs cache. Captured spores still restore by the ext4 BLAKE3 artifact
-digest recorded in the spore manifest; the local tag is not portable identity.
-
-To push the image to a registry instead:
-
-```bash
-bash rails/bin/build-image \
-  --push \
-  --image ghcr.io/YOUR_ORG/sporevm-rails-rspec:dev
-```
-
-CI builds the image on ARM64, runs the shard tests inside it, and checks the
-capture handoff only in builds triggered with `SPOREVM_RAILS_BUILD_LOCAL=1`.
-
-## Run the Fan-Out Demo
+Run from the root of this repository with `spore` on `PATH` (for example
+`mise use -g github:sporevm/sporevm@latest`):
 
 ```bash
 bash rails/bin/fanout-rspec --count 4
 ```
 
-By default `fanout-rspec` builds and imports the local OCI layout first. If the
-image has already been imported, skip that step:
+The script performs these steps:
 
 ```bash
-bash rails/bin/fanout-rspec \
-  --image local/sporevm-rails-rspec:dev \
-  --no-image-build \
-  --count 4
-```
-
-The script performs the product lifecycle explicitly:
-
-```bash
-spore run --image local/sporevm-rails-rspec:dev --save rails-rspec.spore --save-on USR1 -- \
+spore build -t local/sporevm-rails-rspec:dev rails
+spore run --image local/sporevm-rails-rspec:dev --save rails.spore --save-on USR1 -- \
   /bin/bash /usr/local/bin/sporevm-rails-coordinator
-
-spore fork rails-rspec.spore --count 4 --out rails-rspec.children
-for child in rails-rspec.children/*; do
-  spore run --from "${child}" -- /usr/local/bin/sporevm-rspec-shard &
-done
-wait
+# after the guest prints SPOREVM_RAILS_READY: kill -USR1 <spore run pid>
+spore checkpoint fork rails.spore --count 4 --out children
+spore fanout children
 ```
 
-Expected output includes the warm marker from the parent:
+The parent prints one ready line before the save:
 
 ```text
-SPOREVM_POSTGRES_SEED state=stopped duration_ms=...
-SPOREVM_RAILS_READY pid=... capture_delay=2
+SPOREVM_RAILS_READY examples=3 boot_ms=... warm_request_ms=...
 ```
 
-and `fanout-rspec` prefixes one successful RSpec completion marker per child:
+Each child prints its first response and its shard result, and the script
+prefixes every fan-out line with milliseconds since the fan-out started:
 
 ```text
-[000000] SPOREVM_POSTGRES_RESUME action=started status=ready duration_ms=...
-[000000] SPOREVM_RSPEC_DONE parallel_index=0 parallel_count=4 exit=0
-[000001] SPOREVM_RSPEC_DONE parallel_index=1 parallel_count=4 exit=0
+   412 [000000] SPOREVM_RAILS_RESPONSE parallel_index=0 parallel_count=4 status=200 widget_count=0 duration_ms=...
+   498 [000000] SPOREVM_RSPEC_DONE parallel_index=0 parallel_count=4 examples=1 exit=0
 ```
 
-The host script leaves logs and spores in its workdir so the manifest and child
-output can be inspected after the run.
+It ends with per-child `first_response_ms`, a `timings:` line for the build,
+boot, save, fork, and fan-out, and the workdir that keeps the save and logs.
+Pass `--no-image-build` to reuse an image that is already built, or `--image`
+to run a registry image built from the same Dockerfile.
 
 ## Sharding
 
-Forked child manifests contain stable generation params including
-`parallel_index`, `parallel_count`, `fork_index`, `fork_count`,
-`fork_batch_id`, and `vm_id`.
-
-Inside rootfs guests, SporeVM publishes the fork generation payload to:
-
-```text
-/run/sporevm/generation.json
-/run/sporevm/env
-```
-
-`/usr/local/bin/sporevm-rspec-shard` reads those helper files and splits spec
-files by:
+Each child waits until SporeVM publishes its identity in `/run/sporevm/env`
+(`SPORE_FORK_BATCH_ID` is set and `SPORE_GENERATION` is greater than
+`SPORE_PARENT_GENERATION`), then runs every example whose position in the
+sorted example IDs satisfies:
 
 ```ruby
-spec_index % parallel_count == parallel_index
+index % SPORE_PARALLEL_JOB_COUNT == SPORE_PARALLEL_JOB
 ```
 
-Missing identity is treated as a demo failure. Set
-`SPOREVM_RSPEC_ALLOW_UNSHARDED=1` only for ad hoc image debugging outside
-SporeVM, where running the full suite once is more useful than proving fan-out
-identity.
-
-## Useful Knobs
-
-```bash
-bash rails/bin/fanout-rspec --count 8 --memory 4gb
-bash rails/bin/fanout-rspec --backend kvm
-bash rails/bin/fanout-rspec --workdir /tmp/sporevm-rails-demo
-bash rails/bin/fanout-rspec --image ghcr.io/YOUR_ORG/sporevm-rails-rspec:dev --no-image-build
-bash rails/bin/fanout-rspec --kernel /path/to/sporevm-run-arm64-linux-6.1.155-Image
-bash rails/bin/fanout-rspec --capture-delay 5
-```
-
-Environment equivalents:
-
-```bash
-SPORE_RAILS_IMAGE=local/sporevm-rails-rspec:dev
-SPORE_RAILS_OCI=/tmp/sporevm-rails-rspec.oci
-SPORE_RAILS_FANOUT_COUNT=4
-SPORE_RAILS_MEMORY=2gb
-SPORE_RAILS_CAPTURE_DELAY=2
-```
+Children share the parent's Ruby random state; this suite does not depend on
+it, but workloads that generate secrets must reseed after the fork.
