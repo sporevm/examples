@@ -2,12 +2,6 @@
 set -euo pipefail
 
 capture_delay=1
-capture=1
-
-monotonic_ms() {
-  ruby -e 'puts((Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000).round)'
-}
-total_start="$(monotonic_ms)"
 
 while (($#)); do
   case "$1" in
@@ -16,12 +10,8 @@ while (($#)); do
       capture_delay="$2"
       shift 2
       ;;
-    --no-capture)
-      capture=0
-      shift
-      ;;
     -h|--help)
-      echo "usage: sporevm-rails-coordinator [--capture-delay SECONDS] [--no-capture]"
+      echo "usage: sporevm-rails-coordinator [--capture-delay SECONDS]"
       exit 0
       ;;
     *)
@@ -74,9 +64,7 @@ mkdir -p "${HOME}" "${SPOREVM_RAILS_RUNTIME_ROOT}" /tmp/sporevm-postgres/data /t
 cp -a /opt/sporevm-rails-src "${SPOREVM_RAILS_RUNTIME_ROOT}/app"
 chown -R postgres:postgres /tmp/sporevm-postgres
 
-phase_start="$(monotonic_ms)"
 run_as_postgres "${pg_bin}/initdb" -D /tmp/sporevm-postgres/data --auth=trust --no-locale >/tmp/sporevm-postgres/log/initdb.log
-initdb_ms="$(( $(monotonic_ms) - phase_start ))"
 cat >>/tmp/sporevm-postgres/data/postgresql.conf <<'EOF'
 listen_addresses = ''
 unix_socket_directories = '/tmp/sporevm-postgres/run'
@@ -85,23 +73,10 @@ full_page_writes = off
 synchronous_commit = off
 EOF
 chown postgres:postgres /tmp/sporevm-postgres/data/postgresql.conf
-phase_start="$(monotonic_ms)"
 run_as_postgres "${pg_bin}/pg_ctl" -D /tmp/sporevm-postgres/data -l /tmp/sporevm-postgres/log/postgres.log -w start
 trap 'run_as_postgres "${pg_bin}/pg_ctl" -D /tmp/sporevm-postgres/data -m fast stop >/dev/null 2>&1 || true' EXIT
 run_as_postgres "${pg_bin}/createdb" -h /tmp/sporevm-postgres/run sporevm_rails_test
-postgres_ms="$(( $(monotonic_ms) - phase_start ))"
 
 cd "${SPOREVM_RAILS_RUNTIME_ROOT}/app"
-phase_start="$(monotonic_ms)"
 bundle exec ruby bin/rails db:schema:load >/tmp/sporevm-rails/schema-load.log
-schema_ms="$(( $(monotonic_ms) - phase_start ))"
-before_preload_ms="$(( $(monotonic_ms) - total_start ))"
-export SPOREVM_RAILS_INITDB_MS="${initdb_ms}"
-export SPOREVM_RAILS_POSTGRES_MS="${postgres_ms}"
-export SPOREVM_RAILS_SCHEMA_MS="${schema_ms}"
-export SPOREVM_RAILS_BEFORE_PRELOAD_MS="${before_preload_ms}"
-if [[ "${capture}" == "1" ]]; then
-  bundle exec ruby /usr/local/bin/sporevm-rspec-shard --capture-delay "${capture_delay}"
-else
-  bundle exec ruby /usr/local/bin/sporevm-rspec-shard
-fi
+bundle exec ruby /usr/local/bin/sporevm-rspec-shard --capture-delay "${capture_delay}"

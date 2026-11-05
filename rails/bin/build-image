@@ -16,7 +16,6 @@ Options:
   --platform P      Docker build platform (default: linux/arm64)
   --spore-bin PATH  spore CLI to use (default: $SPORE_BIN or spore on PATH)
   --push            Push to a registry instead of importing a local OCI layout
-  --export-oci      With --push, also write the exact result to --oci
   -h, --help        Show this help
 EOF
 }
@@ -100,7 +99,6 @@ oci_output="${SPORE_RAILS_OCI:-${TMPDIR:-/tmp}/sporevm-rails-rspec.oci}"
 platform="${SPORE_RAILS_PLATFORM:-linux/arm64}"
 spore_bin="$(default_spore_bin)"
 push=0
-export_oci=0
 
 while (($#)); do
   case "$1" in
@@ -128,10 +126,6 @@ while (($#)); do
       push=1
       shift
       ;;
-    --export-oci)
-      export_oci=1
-      shift
-      ;;
     -h|--help)
       usage
       exit 0
@@ -144,47 +138,18 @@ done
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
-[[ "${export_oci}" == "0" || "${push}" == "1" ]] || die "--export-oci requires --push"
 
 if [[ "${push}" == "1" ]]; then
   [[ "${image_ref}" != local/* ]] || die "--push requires a registry image ref, not ${image_ref}"
-  [[ "${platform}" == "linux/arm64" ]] || die "--push requires --platform linux/arm64"
-  repo_root="$(git -C "${example_dir}" rev-parse --show-toplevel)"
-  [[ -z "$(git -C "${repo_root}" status --porcelain)" ]] || die "--push requires a clean source checkout"
-  source_revision="$(git -C "${repo_root}" rev-parse HEAD)"
-  [[ "${source_revision}" =~ ^[0-9a-f]{40}$ ]] || die "could not resolve an exact source revision"
-  [[ "${image_ref}" == *":sha-${source_revision}" ]] || die "--push image ref must end in :sha-${source_revision}"
-  command -v tar >/dev/null 2>&1 || die "tar is required to create the exact source context"
-  publish_context="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-rails-publish.XXXXXX")"
-  trap 'rm -rf "${publish_context}"' EXIT
-  git -C "${repo_root}" archive --format=tar "${source_revision}:rails" | tar -xf - -C "${publish_context}"
   phase "build and push Rails image"
-  if [[ "${export_oci}" == "1" ]]; then
-    ensure_buildx_oci_builder
-    rm -f "${oci_output}"
-    mkdir -p "$(dirname "${oci_output}")"
-    docker buildx build \
-      "${buildx_builder_args[@]}" \
-      --platform "${platform}" \
-      --build-arg "VCS_REF=${source_revision}" \
-      --build-arg "SOURCE_URL=https://github.com/sporevm/examples" \
-      --provenance=false \
-      --output "type=registry,name=${image_ref},oci-mediatypes=true" \
-      --output "type=oci,dest=${oci_output},oci-mediatypes=true" \
-      "${publish_context}"
-  else
-    docker buildx build \
-      --platform "${platform}" \
-      --build-arg "VCS_REF=${source_revision}" \
-      --build-arg "SOURCE_URL=https://github.com/sporevm/examples" \
-      -t "${image_ref}" \
-      --push \
-      "${publish_context}"
-  fi
+  docker buildx build \
+    --platform "${platform}" \
+    -t "${image_ref}" \
+    --push \
+    "${example_dir}"
 
   cat <<EOF
 built and pushed ${image_ref}
-$(if [[ "${export_oci}" == "1" ]]; then printf 'exported %s\n' "${oci_output}"; fi)
 
 Run the fan-out demo with:
   bash rails/bin/fanout-rspec --image ${image_ref} --no-image-build
