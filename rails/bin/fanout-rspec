@@ -6,24 +6,22 @@ usage() {
 usage:
   rails/bin/fanout-rspec [options]
 
-Boot a Rails/Postgres OCI rootfs with `spore run --image`, warm the app and
-database, capture the VM, fork it, and resume child spores in parallel to run
-RSpec.
+Build the Rails/PostgreSQL image with `spore build`, boot it once, load Rails
+and the spec suite, serve one warm request, and save the running VM. Then fork
+child spores from that save and attach them with `spore fanout`: each child
+serves a request and runs its share of the RSpec examples in the already-warm
+Ruby process. Exits non-zero if any child fails.
 
 Options:
-  --image REF             OCI image ref to run (default: local/sporevm-rails-rspec:dev)
-  --oci PATH              OCI layout tar path for local image builds
-  --platform P            OCI platform (default: linux/arm64)
-  --count N               Number of child spores to run (default: 4)
-  --backend hvf|kvm       Backend to use (default: infer from host)
-  --memory VALUE          Guest RAM, e.g. 512mb or 2gb (default: 2gb)
-  --capture-delay N       Guest seconds to wait after ready before tests (default: 2)
-  --fanout-timeout N      Host seconds before child runs are killed (default: 300)
-  --workdir DIR           Directory for logs and spores (default: mktemp)
-  --spore-bin PATH        spore CLI to use (default: $SPORE_BIN or spore on PATH)
-  --kernel PATH           Custom run kernel Image (default: managed kernel)
-  --no-image-build        Do not build/import a local OCI layout first
-  -h, --help              Show this help
+  --count N           Number of children (default: 4)
+  --image REF         Image to run (default: local/sporevm-rails-rspec:dev);
+                      only local/ refs are built, others are pulled
+  --no-image-build    Run a local --image as is instead of building it first
+  --memory SIZE       Guest RAM (default: 2gb)
+  --timeout SECONDS   Stop the children after this long (default: 300)
+  --workdir DIR       Directory for the save, children, and logs (default: mktemp)
+  --spore-bin PATH    spore CLI to use (default: $SPORE_BIN or spore on PATH)
+  -h, --help          Show this help
 EOF
 }
 
@@ -33,137 +31,47 @@ die() {
 }
 
 need_value() {
-  local opt="$1"
-  local value="${2-}"
-  [[ -n "${value}" ]] || die "${opt} requires a value"
+  [[ -n "${2-}" ]] || die "$1 requires a value"
 }
 
 valid_positive_int() {
-  case "$1" in
-    ''|*[!0-9]*) return 1 ;;
-    0) return 1 ;;
-    *) return 0 ;;
-  esac
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); pass --backend hvf or --backend kvm" ;;
-  esac
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
 phase() {
   printf '\n==> %s\n' "$*"
 }
 
-elapsed_since() {
-  printf '%s' "$((SECONDS - $1))"
-}
-
-default_spore_bin() {
-  if [[ -n "${SPORE_BIN:-}" ]]; then
-    printf '%s\n' "${SPORE_BIN}"
-  elif command -v spore >/dev/null 2>&1; then
-    command -v spore
+# Wall-clock milliseconds; whole seconds on bash < 5.
+now_ms() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    echo "$(( ${EPOCHREALTIME/[.,]/} / 1000 ))"
   else
-    printf '%s\n' "spore"
+    echo "$(( $(date +%s) * 1000 ))"
   fi
 }
 
-spore_is_executable() {
-  if [[ "${spore_bin}" == */* ]]; then
-    [[ -x "${spore_bin}" ]]
-  else
-    command -v "${spore_bin}" >/dev/null 2>&1
-  fi
-}
-
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-example_dir="$(cd "${script_dir}/.." && pwd)"
-repo_root="$(cd "${example_dir}/.." && pwd)"
-image_ref="${SPORE_RAILS_IMAGE:-local/sporevm-rails-rspec:dev}"
-oci_output="${SPORE_RAILS_OCI:-${TMPDIR:-/tmp}/sporevm-rails-rspec.oci}"
-platform="${SPORE_RAILS_PLATFORM:-linux/arm64}"
-count="${SPORE_RAILS_FANOUT_COUNT:-4}"
-backend=""
-memory="${SPORE_RAILS_MEMORY:-2gb}"
-capture_delay="${SPORE_RAILS_CAPTURE_DELAY:-2}"
-fanout_timeout="${SPORE_RAILS_FANOUT_TIMEOUT:-300}"
+example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+image_ref="local/sporevm-rails-rspec:dev"
+count=4
+memory=2gb
+timeout=300
 workdir=""
-spore_bin="$(default_spore_bin)"
-kernel_image="${SPOREVM_KERNEL_IMAGE:-}"
+spore_bin="${SPORE_BIN:-spore}"
 image_build=1
-total_start="${SECONDS}"
-image_build_seconds=0
-resolve_seconds=0
-warm_capture_seconds=0
-ready_seconds=0
-capture_seconds=0
-fork_seconds=0
-fanout_seconds=0
 
 while (($#)); do
   case "$1" in
-    --image)
+    --count|--image|--memory|--timeout|--workdir|--spore-bin)
       need_value "$1" "${2-}"
-      image_ref="$2"
-      shift 2
-      ;;
-    --oci)
-      need_value "$1" "${2-}"
-      oci_output="$2"
-      shift 2
-      ;;
-    --platform)
-      need_value "$1" "${2-}"
-      platform="$2"
-      shift 2
-      ;;
-    --count)
-      need_value "$1" "${2-}"
-      count="$2"
-      shift 2
-      ;;
-    --backend)
-      need_value "$1" "${2-}"
-      backend="$2"
-      shift 2
-      ;;
-    --memory)
-      need_value "$1" "${2-}"
-      memory="$2"
-      shift 2
-      ;;
-    --capture-delay)
-      need_value "$1" "${2-}"
-      capture_delay="$2"
-      shift 2
-      ;;
-    --fanout-timeout)
-      need_value "$1" "${2-}"
-      fanout_timeout="$2"
-      shift 2
-      ;;
-    --workdir)
-      need_value "$1" "${2-}"
-      workdir="$2"
-      shift 2
-      ;;
-    --spore-bin)
-      need_value "$1" "${2-}"
-      spore_bin="$2"
-      shift 2
-      ;;
-    --kernel)
-      need_value "$1" "${2-}"
-      kernel_image="$2"
+      case "$1" in
+        --count) count="$2" ;;
+        --image) image_ref="$2" ;;
+        --memory) memory="$2" ;;
+        --timeout) timeout="$2" ;;
+        --workdir) workdir="$2" ;;
+        --spore-bin) spore_bin="$2" ;;
+      esac
       shift 2
       ;;
     --no-image-build)
@@ -181,267 +89,120 @@ while (($#)); do
 done
 
 valid_positive_int "${count}" || die "--count must be a positive integer"
-valid_positive_int "${capture_delay}" || die "--capture-delay must be a positive integer"
-valid_positive_int "${fanout_timeout}" || die "--fanout-timeout must be a positive integer"
-
-if [[ -z "${backend}" ]]; then
-  backend="$(infer_backend)"
-fi
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "--backend must be hvf or kvm" ;;
-esac
+valid_positive_int "${timeout}" || die "--timeout must be a positive integer"
+command -v "${spore_bin}" >/dev/null 2>&1 || die "spore not found: ${spore_bin}; set SPORE_BIN or pass --spore-bin"
+# spore build only publishes local/ refs; spore run pulls registry images.
+[[ "${image_ref}" == local/* ]] || image_build=0
 
 if [[ -z "${workdir}" ]]; then
   workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-rails-rspec.XXXXXX")"
-else
-  mkdir -p "${workdir}"
 fi
-
-if [[ -n "${kernel_image}" ]]; then
-  [[ -f "${kernel_image}" ]] || die "kernel image not found: ${kernel_image}"
-  kernel_label="${kernel_image}"
-else
-  kernel_label="managed run kernel"
-fi
+save_dir="${workdir}/rails.spore"
+children_dir="${workdir}/children"
+rm -rf -- "${save_dir}" "${children_dir}"
+mkdir -p "${workdir}"
 
 run_pid=""
-watchdog_pid=""
-child_pids=()
-signal_child_jobs() {
-  local signal="$1"
-  local child_pid
-  local running_pids
-  running_pids="$(jobs -pr)"
-  for child_pid in "${child_pids[@]}"; do
-    if grep -Fxq "${child_pid}" <<<"${running_pids}"; then
-      kill -"${signal}" "${child_pid}" >/dev/null 2>&1 || true
-    fi
-  done
-}
 cleanup() {
   if [[ -n "${run_pid}" ]]; then
     kill -TERM "${run_pid}" >/dev/null 2>&1 || true
     wait "${run_pid}" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${watchdog_pid}" ]]; then
-    kill "${watchdog_pid}" >/dev/null 2>&1 || true
-    wait "${watchdog_pid}" >/dev/null 2>&1 || true
-  fi
-  signal_child_jobs TERM
-  for child_pid in "${child_pids[@]}"; do
-    wait "${child_pid}" >/dev/null 2>&1 || true
-  done
 }
 trap cleanup EXIT
 
-phase "workspace"
-printf 'examples:   %s\n' "${repo_root}"
-printf 'spore:      %s\n' "${spore_bin}"
-printf 'workdir:    %s\n' "${workdir}"
-printf 'backend:    %s\n' "${backend}"
-printf 'children:   %s\n' "${count}"
-printf 'memory:     %s\n' "${memory}"
-printf 'image:      %s\n' "${image_ref}"
-printf 'kernel:     %s\n' "${kernel_label}"
+printf 'spore:    %s (%s)\n' "$(command -v "${spore_bin}")" "$("${spore_bin}" version 2>/dev/null || echo unknown)"
+printf 'image:    %s\n' "${image_ref}"
+printf 'children: %s\n' "${count}"
+printf 'workdir:  %s\n' "${workdir}"
 
-spore_is_executable || die "spore binary not executable: ${spore_bin}; set SPORE_BIN or pass --spore-bin"
-
-if [[ "${image_build}" == "1" && "${image_ref}" == local/* ]]; then
-  phase_start="${SECONDS}"
-  phase "build and import Rails OCI layout"
-  build_image_args=(
-    --image "${image_ref}"
-    --oci "${oci_output}"
-    --platform "${platform}"
-    --spore-bin "${spore_bin}"
-  )
-  bash "${repo_root}/rails/bin/build-image" "${build_image_args[@]}"
-  image_build_seconds="$(elapsed_since "${phase_start}")"
-elif [[ "${image_build}" == "1" ]]; then
-  phase_start="${SECONDS}"
-  phase "use registry image"
-  printf 'assuming %s is already pushed and reachable by spore rootfs\n' "${image_ref}"
-  image_build_seconds="$(elapsed_since "${phase_start}")"
+build_ms=0
+if [[ "${image_build}" == "1" ]]; then
+  phase "build ${image_ref}"
+  started="$(now_ms)"
+  "${spore_bin}" build -t "${image_ref}" --memory 4gb --vcpus 4 "${example_dir}"
+  build_ms="$(( $(now_ms) - started ))"
 fi
 
-phase_start="${SECONDS}"
-phase "resolve Rails rootfs"
-resolved_image_ref="$("${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
-printf 'resolved: %s\n' "${resolved_image_ref}"
-resolve_seconds="$(elapsed_since "${phase_start}")"
-
-capture_dir="${workdir}/rails-rspec.spore"
-fork_dir="${workdir}/rails-rspec.children"
-run_stdout="${workdir}/parent.stdout"
-run_stderr="${workdir}/parent.stderr"
-fanout_stdout="${workdir}/fanout.stdout"
-fanout_stderr="${workdir}/fanout.stderr"
-fork_stdout="${workdir}/fork.stdout"
-fork_stderr="${workdir}/fork.stderr"
-child_stdout=()
-child_stderr=()
-
-rm -rf -- "${capture_dir}" "${fork_dir}"
-rm -f -- "${run_stdout}" "${run_stderr}" "${fanout_stdout}" "${fanout_stderr}" "${fork_stdout}" "${fork_stderr}"
-
-phase "warm Rails/Postgres and capture"
-phase_start="${SECONDS}"
-: >"${run_stdout}"
-: >"${run_stderr}"
-run_args=(
-  run
-  --backend "${backend}"
-  --memory "${memory}"
-)
-if [[ -n "${kernel_image}" ]]; then
-  run_args+=(--kernel "${kernel_image}")
-fi
-run_args+=(
-  --image "${resolved_image_ref}"
-  --save "${capture_dir}"
-  --save-on USR1
-)
-"${spore_bin}" "${run_args[@]}" \
-  -- /bin/bash /usr/local/bin/sporevm-rails-coordinator --capture-delay "${capture_delay}" \
-  >"${run_stdout}" 2>"${run_stderr}" &
+phase "boot Rails once, then save"
+started="$(now_ms)"
+"${spore_bin}" run --image "${image_ref}" --memory "${memory}" --save "${save_dir}" --save-on USR1 \
+  -- /bin/bash /usr/local/bin/sporevm-rails-coordinator >"${workdir}/parent.log" 2>&1 &
 run_pid="$!"
 
-ready=0
-for _ in $(seq 1 "${SPORE_RAILS_READY_POLLS:-900}"); do
-  if grep -Fq "SPOREVM_RAILS_READY" "${run_stdout}"; then
-    ready=1
-    break
-  fi
-  if ! kill -0 "${run_pid}" >/dev/null 2>&1; then
-    break
-  fi
-  sleep "${SPORE_RAILS_READY_POLL_INTERVAL:-1}"
+for ((polls = timeout * 10; polls > 0; polls--)); do
+  grep -q '^SPOREVM_RAILS_READY ' "${workdir}/parent.log" && break
+  kill -0 "${run_pid}" 2>/dev/null || break
+  sleep 0.1
 done
-if [[ "${ready}" != "1" ]]; then
-  tail -120 "${run_stdout}" >&2 || true
-  tail -200 "${run_stderr}" >&2 || true
-  die "Rails/Postgres VM did not reach the ready marker"
+if ! grep -q '^SPOREVM_RAILS_READY ' "${workdir}/parent.log"; then
+  cat "${workdir}/parent.log" >&2
+  die "Rails did not become ready in the parent VM"
 fi
-ready_seconds="$(elapsed_since "${phase_start}")"
+ready_ms="$(( $(now_ms) - started ))"
+grep '^SPOREVM_RAILS_READY ' "${workdir}/parent.log"
+total_examples="$(sed -n 's/^SPOREVM_RAILS_READY examples=\([0-9]*\) .*/\1/p' "${workdir}/parent.log")"
 
-tail -40 "${run_stdout}" || true
-sleep "${SPORE_RAILS_CAPTURE_SETTLE_SECONDS:-0.2}"
-printf 'saving with USR1...\n'
-capture_start="${SECONDS}"
+started="$(now_ms)"
 kill -USR1 "${run_pid}"
-
-(
-  sleep "${SPORE_RAILS_CAPTURE_TIMEOUT:-60}"
-  kill -TERM "${run_pid}" >/dev/null 2>&1 || true
-) &
-watchdog_pid="$!"
-
-set +e
-wait "${run_pid}"
-run_rc="$?"
-set -e
+while kill -0 "${run_pid}" 2>/dev/null; do
+  if (( $(now_ms) - started > 60000 )); then
+    cat "${workdir}/parent.log" >&2
+    die "spore run did not finish saving within 60s"
+  fi
+  sleep 0.01
+done
+if ! wait "${run_pid}"; then
+  run_pid=""
+  cat "${workdir}/parent.log" >&2
+  die "spore run did not save cleanly"
+fi
 run_pid=""
-kill "${watchdog_pid}" >/dev/null 2>&1 || true
-wait "${watchdog_pid}" >/dev/null 2>&1 || true
-watchdog_pid=""
+save_ms="$(( $(now_ms) - started ))"
 
-if [[ "${run_rc}" != "0" ]]; then
-  cat "${run_stdout}" >&2 || true
-  cat "${run_stderr}" >&2 || true
-  die "spore run save exited ${run_rc}, expected 0"
-fi
-[[ -f "${capture_dir}/manifest.json" ]] || die "save did not write ${capture_dir}/manifest.json"
-grep -Fq '"rootfs"' "${capture_dir}/manifest.json" || die "saved manifest did not record rootfs metadata"
-capture_seconds="$(elapsed_since "${capture_start}")"
-warm_capture_seconds="$(elapsed_since "${phase_start}")"
+phase "fork ${count} children"
+started="$(now_ms)"
+"${spore_bin}" checkpoint fork "${save_dir}" --count "${count}" --out "${children_dir}" >"${workdir}/fork.log"
+fork_ms="$(( $(now_ms) - started ))"
 
-phase "fork ${count} child spores"
-phase_start="${SECONDS}"
-"${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" \
-  >"${fork_stdout}" 2>"${fork_stderr}"
-
-children_found="$(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
-[[ "${children_found}" == "${count}" ]] || die "expected ${count} child spores, found ${children_found}"
-fork_seconds="$(elapsed_since "${phase_start}")"
-
-phase "resume children and run RSpec"
-phase_start="${SECONDS}"
-for i in $(seq 0 $((count - 1))); do
-  child_name="$(printf "%06d" "${i}")"
-  child_stdout[$i]="${workdir}/child-${child_name}.stdout"
-  child_stderr[$i]="${workdir}/child-${child_name}.stderr"
-  "${spore_bin}" run --backend "${backend}" --from "${fork_dir}/${child_name}" \
-    -- /usr/local/bin/sporevm-rspec-shard \
-    >"${child_stdout[$i]}" 2>"${child_stderr[$i]}" &
-  child_pids[$i]="$!"
-done
-
-fanout_timed_out=0
-for _ in $(seq 1 "${fanout_timeout}"); do
-  if [[ -z "$(jobs -pr)" ]]; then
-    break
-  fi
-  sleep 1
-done
-if [[ -n "$(jobs -pr)" ]]; then
-  fanout_timed_out=1
-  signal_child_jobs TERM
-  sleep 5
-  signal_child_jobs KILL
-fi
-
-fanout_rc=0
+phase "fan out"
+# Prefix each line with milliseconds since fan-out started. Guest output
+# can arrive with CRLF line endings.
+started="$(now_ms)"
 set +e
-for child_pid in "${child_pids[@]}"; do
-  wait "${child_pid}"
-  child_rc="$?"
-  if [[ "${child_rc}" != "0" ]]; then
-    fanout_rc=1
-  fi
-done
+"${spore_bin}" fanout --for "${timeout}s" "${children_dir}" 2>&1 |
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    printf '%6d %s\n' "$(( $(now_ms) - started ))" "${line%$'\r'}"
+  done | tee "${workdir}/fanout.log"
+fanout_rc="${PIPESTATUS[0]}"
 set -e
-child_pids=()
+fanout_ms="$(( $(now_ms) - started ))"
 
-: >"${fanout_stdout}"
-: >"${fanout_stderr}"
-for i in $(seq 0 $((count - 1))); do
-  child_name="$(printf "%06d" "${i}")"
-  sed "s/^/[${child_name}] /" "${child_stdout[$i]}" >>"${fanout_stdout}"
-  sed "s/^/[${child_name}] /" "${child_stderr[$i]}" >>"${fanout_stderr}"
-done
-cat "${fanout_stdout}"
-if [[ "${fanout_timed_out}" == "1" ]]; then
-  cat "${fanout_stderr}" >&2 || true
-  die "parallel spore run timed out after ${fanout_timeout}s"
-fi
-if [[ "${fanout_rc}" != "0" ]]; then
-  cat "${fanout_stderr}" >&2 || true
-  die "one or more parallel spore run commands failed"
-fi
-
-for i in $(seq 0 $((count - 1))); do
-  child_name="$(printf "%06d" "${i}")"
-  if ! grep -Eaq "\\[${child_name}\\].*SPOREVM_RSPEC_SHARD parallel_index=${i} parallel_count=${count} " "${fanout_stdout}"; then
-    cat "${fanout_stderr}" >&2 || true
-    die "child ${child_name} did not report expected shard identity ${i}/${count}"
+phase "results"
+failed=0
+examples_run=0
+for ((i = 0; i < count; i++)); do
+  child="$(printf '%06d' "${i}")"
+  response_line="$(grep -E "^ *[0-9]+ \[${child}\] SPOREVM_RAILS_RESPONSE parallel_index=${i} parallel_count=${count} " "${workdir}/fanout.log" | head -n 1 || true)"
+  done_line="$(grep -E "^ *[0-9]+ \[${child}\] SPOREVM_RSPEC_DONE parallel_index=${i} parallel_count=${count} examples=[0-9]+ exit=0$" "${workdir}/fanout.log" | head -n 1 || true)"
+  if [[ -z "${response_line}" || -z "${done_line}" ]]; then
+    printf 'child %s: FAILED\n' "${child}"
+    failed=1
+    continue
   fi
-  if ! grep -Eaq "\\[${child_name}\\].*SPOREVM_RSPEC_DONE parallel_index=${i} parallel_count=${count} exit=0" "${fanout_stdout}"; then
-    cat "${fanout_stderr}" >&2 || true
-    die "child ${child_name} did not report a successful RSpec shard"
-  fi
+  read -r response_ms _ <<<"${response_line}"
+  read -r done_ms _ <<<"${done_line}"
+  child_examples="$(sed -n 's/.* examples=\([0-9]*\) exit=0$/\1/p' <<<"${done_line}")"
+  examples_run="$((examples_run + child_examples))"
+  printf 'child %s: first_response_ms=%s rspec_done_ms=%s examples=%s\n' "${child}" "${response_ms}" "${done_ms}" "${child_examples}"
 done
-fanout_seconds="$(elapsed_since "${phase_start}")"
 
-phase "done"
-printf 'rails rspec fan-out ok backend=%s count=%s image=%s\n' "${backend}" "${count}" "${resolved_image_ref}"
-printf 'timings: image_build_import=%ss resolve=%ss ready=%ss capture=%ss warm_capture=%ss fork=%ss fanout=%ss total=%ss\n' \
-  "${image_build_seconds}" \
-  "${resolve_seconds}" \
-  "${ready_seconds}" \
-  "${capture_seconds}" \
-  "${warm_capture_seconds}" \
-  "${fork_seconds}" \
-  "${fanout_seconds}" \
-  "$(elapsed_since "${total_start}")"
-printf 'logs and spores kept in: %s\n' "${workdir}"
+printf 'timings: build_ms=%s boot_to_ready_ms=%s save_ms=%s fork_ms=%s fanout_ms=%s\n' \
+  "${build_ms}" "${ready_ms}" "${save_ms}" "${fork_ms}" "${fanout_ms}"
+
+[[ "${fanout_rc}" == "0" ]] || die "spore fanout exited ${fanout_rc}"
+[[ "${failed}" == "0" ]] || die "one or more children did not finish their shard"
+# A ready line from a child means it loaded Rails itself instead of resuming the fork.
+! grep -Fq '] SPOREVM_RAILS_READY' "${workdir}/fanout.log" || die "a child loaded Rails again instead of resuming the warm process"
+[[ "${examples_run}" == "${total_examples}" ]] || die "children ran ${examples_run} examples, expected ${total_examples}"
+echo "rails fan-out ok: ${count} children ran ${examples_run} examples"

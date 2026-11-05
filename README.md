@@ -5,9 +5,9 @@ Examples for running real application workloads with
 
 ## Examples
 
-- [Rails/Postgres RSpec fan-out](rails/README.md): build a Rails/Postgres test
-  image with Docker buildx, import it into SporeVM's local rootfs cache, warm the
-  VM once, capture it, fork child spores, and run RSpec shards in parallel.
+- [Rails/Postgres RSpec fan-out](rails/README.md): build a Rails/Postgres image
+  with `spore build`, boot it once with Rails loaded, save the running VM, and
+  fork children that each run an RSpec shard in the warm Ruby process.
 
 ## Quick Start
 
