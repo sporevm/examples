@@ -16,7 +16,7 @@ Build the exact candidate used by CI (requires Git, mise and Linux ARM64 KVM):
 
 ```bash
 git clone https://github.com/sporevm/sporevm.git /tmp/sporevm-candidate
-git -C /tmp/sporevm-candidate checkout a9cfff5600772fdb1ff476804b8e05cd476dbf45
+git -C /tmp/sporevm-candidate checkout 7833a3911d27ebad2f2d13b8e3fd2a5dd0ac572d
 mise trust /tmp/sporevm-candidate/mise.toml
 mise -C /tmp/sporevm-candidate exec zig@0.16.0 -- zig build --release=safe
 export PATH="/tmp/sporevm-candidate/zig-out/bin:$PATH"

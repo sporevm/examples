@@ -4,7 +4,7 @@ set -euo pipefail
 
 # v0.17.1 cannot run this command vocabulary. Switch to a release archive and
 # its checksum only after a compatible release exists and passes this demo.
-spore_commit="a9cfff5600772fdb1ff476804b8e05cd476dbf45"
+spore_commit="7833a3911d27ebad2f2d13b8e3fd2a5dd0ac572d"
 
 # Keep spore's caches, runtime state, saves, and logs in one job directory:
 # image-backed saves must share a filesystem with the rootfs cache, and other
