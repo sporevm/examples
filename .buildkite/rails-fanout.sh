@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Run the Rails fan-out demo end to end with a pinned SporeVM release.
+# Run the Rails fan-out demo against the exact unreleased CLI candidate.
 set -euo pipefail
 
-spore_version="v0.17.1"
-spore_sha256="07452068394f2cbac911cffda1dd5d97692ed5b4c5d85b30d03401654ab89327"
+# v0.17.1 cannot run this command vocabulary. Switch to a release archive and
+# its checksum only after a compatible release exists and passes this demo.
+spore_commit="e4fffdbefe4a6ec29af2f080208fa3e9b008591f"
 
 # Keep spore's caches, runtime state, saves, and logs in one job directory:
 # image-backed saves must share a filesystem with the rootfs cache, and other
@@ -31,10 +32,13 @@ export TMPDIR="${work}/tmp"
 mkdir -p "${XDG_CACHE_HOME}" "${TMPDIR}"
 mkdir -m 700 "${SPOREVM_RUNTIME_DIR}"
 
-curl -fsSL --retry 3 -o "${work}/spore.tar.gz" \
-  "https://github.com/sporevm/sporevm/releases/download/${spore_version}/spore_Linux_arm64.tar.gz"
-echo "${spore_sha256}  ${work}/spore.tar.gz" | sha256sum -c -
-tar -xzf "${work}/spore.tar.gz" -C "${work}"
-export PATH="${work}/spore_Linux_arm64/bin:${PATH}"
+git init -q "${work}/source"
+git -C "${work}/source" remote add origin https://github.com/sporevm/sporevm.git
+git -C "${work}/source" fetch --depth 1 origin "${spore_commit}"
+git -C "${work}/source" checkout --detach FETCH_HEAD
+[[ "$(git -C "${work}/source" rev-parse HEAD)" == "${spore_commit}" ]]
+mise trust "${work}/source/mise.toml"
+mise -C "${work}/source" exec zig@0.16.0 -- zig build --release=safe
+export PATH="${work}/source/zig-out/bin:${PATH}"
 
 bash rails/bin/fanout-rspec --count 4 --workdir "${work}/run"

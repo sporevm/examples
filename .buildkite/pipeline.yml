@@ -2,6 +2,9 @@ steps:
   - label: ":rails: Rails fan-out (Linux ARM64 KVM)"
     key: rails-fanout-linux-arm64
     command: bash .buildkite/rails-fanout.sh
+    plugins:
+      - mise#e53a95a05d51dd20b1bfcd98fb3f9fe13292812b:
+          version: "2026.5.12"
     agents:
       queue: sporevm-linux-arm64
     timeout_in_minutes: 30
