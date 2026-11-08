@@ -8,7 +8,7 @@ This example boots a Rails app once and forks the running process:
    then one Ruby process loads Rails and every spec file and serves a warm
    `GET /health`.
 3. The host saves the running VM and forks N children from the save.
-4. `spore fanout` resumes every child inside that same Ruby process. Each child
+4. `spore checkpoint fanout` resumes every child inside that same Ruby process. Each child
    reads its fork identity, serves `GET /health` against its own live
    PostgreSQL, and runs its share of the RSpec examples. Nothing is loaded
    again.
@@ -18,8 +18,9 @@ fails.
 
 ## Run It
 
-Run from the root of this repository with `spore` on `PATH` (for example
-`mise use -g github:sporevm/sporevm@latest`):
+Use the source-built candidate from the [repository quick start](../README.md#quick-start),
+then run from the root of this repository. The published v0.17.1 uses different
+commands and cannot run this wrapper:
 
 ```bash
 bash rails/bin/fanout-rspec --count 4
@@ -28,12 +29,12 @@ bash rails/bin/fanout-rspec --count 4
 The script performs these steps:
 
 ```bash
-spore build -t local/sporevm-rails-rspec:dev rails
-spore run --image local/sporevm-rails-rspec:dev --save rails.spore --save-on USR1 -- \
+spore build --tag local/sporevm-rails-rspec:dev rails
+spore run --image local/sporevm-rails-rspec:dev --save-checkpoint rails.spore --save-on USR1 -- \
   /bin/bash /usr/local/bin/sporevm-rails-coordinator
 # after the guest prints SPOREVM_RAILS_READY: kill -USR1 <spore run pid>
-spore checkpoint fork rails.spore --count 4 --out children
-spore fanout children
+spore checkpoint fork rails.spore --count 4 --output children
+spore checkpoint fanout children
 ```
 
 The parent prints one ready line before the save:

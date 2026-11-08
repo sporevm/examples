@@ -11,11 +11,15 @@ Examples for running real application workloads with
 
 ## Quick Start
 
-The scripts use `spore` from `PATH`. If needed, install the latest with
-`mise`:
+These scripts use the unreleased 0.18.0 CLI, not the published v0.17.1 CLI.
+Build the exact candidate used by CI (requires Git, mise and Linux ARM64 KVM):
 
 ```bash
-mise use -g github:sporevm/sporevm@latest
+git clone https://github.com/sporevm/sporevm.git /tmp/sporevm-candidate
+git -C /tmp/sporevm-candidate checkout a9cfff5600772fdb1ff476804b8e05cd476dbf45
+mise trust /tmp/sporevm-candidate/mise.toml
+mise -C /tmp/sporevm-candidate exec zig@0.16.0 -- zig build --release=safe
+export PATH="/tmp/sporevm-candidate/zig-out/bin:$PATH"
 ```
 
 Then run the examples from this repository root:
@@ -23,3 +27,7 @@ Then run the examples from this repository root:
 ```bash
 bash rails/bin/fanout-rspec --count 4
 ```
+
+CI pins that source commit in `.buildkite/rails-fanout.sh`; it does not download
+an unpublished 0.18.0 release or silently test against 0.17.1. Switch to a
+compatible release archive and verified checksum only after publication.

@@ -8,7 +8,7 @@ usage:
 
 Build the Rails/PostgreSQL image with `spore build`, boot it once, load Rails
 and the spec suite, serve one warm request, and save the running VM. Then fork
-child spores from that save and attach them with `spore fanout`: each child
+child spores from that save and resume them with `spore checkpoint fanout`: each child
 serves a request and runs its share of the RSpec examples in the already-warm
 Ruby process. Exits non-zero if any child fails.
 
@@ -120,13 +120,13 @@ build_ms=0
 if [[ "${image_build}" == "1" ]]; then
   phase "build ${image_ref}"
   started="$(now_ms)"
-  "${spore_bin}" build -t "${image_ref}" --memory 4gb --vcpus 4 "${example_dir}"
+  "${spore_bin}" build --tag "${image_ref}" --memory 4gb --vcpus 4 "${example_dir}"
   build_ms="$(( $(now_ms) - started ))"
 fi
 
 phase "boot Rails once, then save"
 started="$(now_ms)"
-"${spore_bin}" run --image "${image_ref}" --memory "${memory}" --save "${save_dir}" --save-on USR1 \
+"${spore_bin}" run --image "${image_ref}" --memory "${memory}" --save-checkpoint "${save_dir}" --save-on USR1 \
   -- /bin/bash /usr/local/bin/sporevm-rails-coordinator >"${workdir}/parent.log" 2>&1 &
 run_pid="$!"
 
@@ -162,7 +162,7 @@ save_ms="$(( $(now_ms) - started ))"
 
 phase "fork ${count} children"
 started="$(now_ms)"
-"${spore_bin}" checkpoint fork "${save_dir}" --count "${count}" --out "${children_dir}" >"${workdir}/fork.log"
+"${spore_bin}" checkpoint fork "${save_dir}" --count "${count}" --output "${children_dir}" >"${workdir}/fork.log"
 fork_ms="$(( $(now_ms) - started ))"
 
 phase "fan out"
@@ -170,7 +170,7 @@ phase "fan out"
 # can arrive with CRLF line endings.
 started="$(now_ms)"
 set +e
-"${spore_bin}" fanout --for "${timeout}s" "${children_dir}" 2>&1 |
+"${spore_bin}" checkpoint fanout --for "${timeout}s" "${children_dir}" 2>&1 |
   while IFS= read -r line || [[ -n "${line}" ]]; do
     printf '%6d %s\n' "$(( $(now_ms) - started ))" "${line%$'\r'}"
   done | tee "${workdir}/fanout.log"
@@ -200,7 +200,7 @@ done
 printf 'timings: build_ms=%s boot_to_ready_ms=%s save_ms=%s fork_ms=%s fanout_ms=%s\n' \
   "${build_ms}" "${ready_ms}" "${save_ms}" "${fork_ms}" "${fanout_ms}"
 
-[[ "${fanout_rc}" == "0" ]] || die "spore fanout exited ${fanout_rc}"
+[[ "${fanout_rc}" == "0" ]] || die "spore checkpoint fanout exited ${fanout_rc}"
 [[ "${failed}" == "0" ]] || die "one or more children did not finish their shard"
 # A ready line from a child means it loaded Rails itself instead of resuming the fork.
 ! grep -Fq '] SPOREVM_RAILS_READY' "${workdir}/fanout.log" || die "a child loaded Rails again instead of resuming the warm process"
